@@ -1,7 +1,8 @@
 # SoundFocus
 
-Global hotkey that jumps to the window of whatever app is currently making sound.
-Press it again to cycle through the others if more than one is noisy.
+Global hotkey that jumps to the window — or browser tab — of whatever app is currently
+making sound. Press it again to cycle through the others if more than one is noisy, and a
+second hotkey takes you back to what you were doing.
 
 <p align="center">
   <img align="center" width="576" height="200" alt="image" src="https://github.com/user-attachments/assets/3112eda0-a85e-4335-a95f-76568e9d2771" />
@@ -28,8 +29,9 @@ machine. If `SoundFocus.ico` is missing, the build draws it first via `make-icon
 ```powershell
 cd bin\Release\net48
 
-.\SoundFocus.exe                       # tray app, default hotkey Alt+Shift+D
+.\SoundFocus.exe                       # tray app: Alt+Shift+D jumps, Alt+Shift+F goes back
 .\SoundFocus.exe --hotkey ctrl+alt+f9  # any ctrl/alt/shift/win + letter or F-key
+.\SoundFocus.exe --return-hotkey ctrl+alt+f8
 .\SoundFocus.exe --list                # print what is making sound right now, then exit
 .\SoundFocus.exe --menu                # print what the tray menu would list
 .\SoundFocus.exe --debug               # raw per-session dump (devices / state / peak / pid)
@@ -57,6 +59,22 @@ powershell -NoProfile -File install-autostart.ps1 -Remove
 
 Writes a shortcut into the per-user Startup folder — no admin rights, nothing in the
 registry, removable with `-Remove`. It builds the exe first if it is missing.
+
+## Going back — Alt+Shift+F
+
+Stop or change what is playing, then return to what you were doing. The return hotkey
+focuses the window you were on before SoundFocus moved you, and from then on toggles
+between the two.
+
+Cycling does **not** overwrite the saved origin: pressing the jump hotkey several times to
+step through noisy windows still returns you to the thing you were actually working on,
+not to the previous noisy window. The tray menu shows the destination by name
+(`Back to <window title>`), so it is never a blind jump.
+
+Note that `Alt+Shift+F` is *free as a global hotkey* — verified with `RegisterHotKey`, no
+other app claims it — but VS Code and Visual Studio use Shift+Alt+F for Format Document as
+an **in-app** shortcut. A global hotkey wins, so those editors will stop seeing it. If you
+format code that way, pick something else with `--return-hotkey`.
 
 ## Tray
 

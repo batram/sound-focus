@@ -441,6 +441,7 @@ namespace SoundFocus
         [DllImport("user32.dll")] static extern int GetWindowTextLength(IntPtr h);
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder sb, int max);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+        [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
         [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
         [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
         [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
@@ -1063,23 +1064,35 @@ namespace SoundFocus
 
     class HotkeyWindow : NativeWindow, IDisposable
     {
-        public event EventHandler Pressed;
+        // id of the hotkey that fired: 1 = jump to sound, 2 = go back
+        public event Action<int> Pressed;
         const int WM_HOTKEY = 0x0312;
+
+        readonly List<int> registered = new List<int>();
 
         [DllImport("user32.dll")] static extern bool RegisterHotKey(IntPtr h, int id, int mods, int vk);
         [DllImport("user32.dll")] static extern bool UnregisterHotKey(IntPtr h, int id);
 
         public HotkeyWindow() { CreateHandle(new CreateParams()); }
 
-        public bool Register(int mods, int vk) { return RegisterHotKey(Handle, 1, mods, vk); }
+        public bool Register(int id, int mods, int vk)
+        {
+            if (!RegisterHotKey(Handle, id, mods, vk)) return false;
+            registered.Add(id);
+            return true;
+        }
 
         protected override void WndProc(ref Message m)
         {
-            if (m.Msg == WM_HOTKEY && Pressed != null) Pressed(this, EventArgs.Empty);
+            if (m.Msg == WM_HOTKEY && Pressed != null) Pressed((int)m.WParam);
             base.WndProc(ref m);
         }
 
-        public void Dispose() { UnregisterHotKey(Handle, 1); DestroyHandle(); }
+        public void Dispose()
+        {
+            foreach (int id in registered) UnregisterHotKey(Handle, id);
+            DestroyHandle();
+        }
     }
 
     static class Program
@@ -1098,6 +1111,7 @@ namespace SoundFocus
         static bool useTabs = true;
         static ContextMenuStrip menu;
         static string hotkeySpec = "";
+        static string returnSpec = "";
 
         // The icon ships inside the exe twice: as a Win32 resource so Explorer shows it,
         // and as an embedded resource read here. The embedded copy keeps all its frames,
@@ -1119,10 +1133,12 @@ namespace SoundFocus
         static int Main(string[] argv)
         {
             string hotkey = "alt+shift+d";
+            string returnHotkey = "alt+shift+f";
             bool listOnly = false, debug = false, testTab = false, showMenu = false;
             for (int i = 0; i < argv.Length; i++)
             {
                 if (argv[i] == "--hotkey" && i + 1 < argv.Length) hotkey = argv[++i];
+                else if (argv[i] == "--return-hotkey" && i + 1 < argv.Length) returnHotkey = argv[++i];
                 else if (argv[i] == "--send" && i + 1 < argv.Length)
                 {
                     string spec = argv[++i];
@@ -1145,12 +1161,15 @@ namespace SoundFocus
                     TabHunter.MuteLabels = new string[] { argv[++i].ToLowerInvariant() };
                 else if (argv[i] == "--help" || argv[i] == "-h")
                 {
-                    MessageBox.Show("SoundFocus [--hotkey alt+shift+d] [--send exe=chord] [--list] [--debug]\n\n" +
-                        "Jumps to the window of the app currently making sound.\n" +
+                    MessageBox.Show("SoundFocus [--hotkey alt+shift+d] [--return-hotkey alt+shift+f]\n" +
+                        "           [--send exe=chord] [--list] [--menu] [--debug]\n\n" +
+                        "Jumps to the window, or browser tab, currently making sound.\n" +
                         "Press the hotkey repeatedly to cycle through all noisy apps.\n\n" +
+                        "The return hotkey goes back to where you were before that jump,\n" +
+                        "and toggles between the two from then on.\n\n" +
                         "--send types a chord into the app once it is focused, for in-app\n" +
                         "navigation the OS cannot do, e.g.:\n" +
-                        "  --send firefox.exe=alt+shift+d",
+                        "  --send example.exe=ctrl+alt+j",
                         "SoundFocus");
                     return 0;
                 }
@@ -1269,18 +1288,37 @@ namespace SoundFocus
                 }
             }
 
+            int backMods, backVk;
+            if (!ParseHotkey(returnHotkey, out backMods, out backVk))
+            {
+                MessageBox.Show("Could not parse --return-hotkey: " + returnHotkey, "SoundFocus");
+                return 2;
+            }
+
             HotkeyWindow hk = new HotkeyWindow();
-            if (!hk.Register(mods, vk))
+            if (!hk.Register(1, mods, vk))
             {
                 MessageBox.Show("Hotkey " + hotkey + " is already taken by another app.", "SoundFocus");
                 return 3;
             }
-            hk.Pressed += OnHotkey;
+            if (!hk.Register(2, backMods, backVk))
+            {
+                MessageBox.Show("Return hotkey " + returnHotkey + " is already taken by another app.\n" +
+                                "SoundFocus will run without it; pick another with --return-hotkey.",
+                                "SoundFocus");
+                returnHotkey = "";
+            }
+            hk.Pressed += delegate(int id)
+            {
+                if (id == 1) OnHotkey(null, null);
+                else if (id == 2) OnReturn();
+            };
 
             watcher.Start();
             StartPrewarm();
 
             hotkeySpec = hotkey;
+            returnSpec = returnHotkey;
             menu = new ContextMenuStrip();
             menu.Opening += BuildMenu;
 
@@ -1412,8 +1450,46 @@ namespace SoundFocus
             return targets;
         }
 
+        static IntPtr returnTo = IntPtr.Zero;
+        static string returnTitle = "";
+
+        // Where the user was before SoundFocus moved them. Cycling between noisy windows
+        // must not overwrite it: the point is to get back to what they were actually
+        // doing, not to the previous thing SoundFocus jumped to.
+        static void RememberOrigin()
+        {
+            IntPtr fg = Win.GetForegroundWindow();
+            if (fg == IntPtr.Zero) return;
+            lock (targetGate)
+                foreach (Target t in targetCache)
+                    if (t.Window == fg) return;
+
+            returnTo = fg;
+            returnTitle = Win.TitleOf(fg);
+        }
+
+        static void OnReturn()
+        {
+            if (returnTo == IntPtr.Zero || !Win.IsWindow(returnTo))
+            {
+                tray.ShowBalloonTip(1500, "SoundFocus", "Nowhere to go back to yet.", ToolTipIcon.Info);
+                return;
+            }
+            IntPtr back = returnTo;
+            // Going back makes where we are now the place to come back to, so the same
+            // key toggles between the two.
+            IntPtr here = Win.GetForegroundWindow();
+            Win.Focus(back);
+            if (here != IntPtr.Zero && here != back)
+            {
+                returnTo = here;
+                returnTitle = Win.TitleOf(here);
+            }
+        }
+
         static void GoTo(Target t)
         {
+            RememberOrigin();
             lastFocused = t.Window;
 
             // select the tab before raising the window, so it comes up already showing it
@@ -1499,6 +1575,17 @@ namespace SoundFocus
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("Jump to sound (" + hotkeySpec + ")",
                 null, delegate { OnHotkey(null, null); }));
+
+            if (returnTo != IntPtr.Zero && Win.IsWindow(returnTo))
+            {
+                string what = returnTitle;
+                if (string.IsNullOrEmpty(what)) what = "previous window";
+                if (what.Length > 45) what = what.Substring(0, 44) + "…";
+                menu.Items.Add(new ToolStripMenuItem(
+                    "Back to " + what + (returnSpec.Length > 0 ? "  (" + returnSpec + ")" : ""),
+                    null, delegate { OnReturn(); }));
+            }
+
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("Exit", null, delegate { Application.Exit(); }));
         }
