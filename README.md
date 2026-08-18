@@ -37,6 +37,7 @@ cd bin\Release\net48
 .\SoundFocus.exe                       # tray app: Alt+Shift+D jumps, Alt+Shift+F goes back
 .\SoundFocus.exe --hotkey ctrl+alt+f9  # any ctrl/alt/shift/win + letter or F-key
 .\SoundFocus.exe --return-hotkey ctrl+alt+f8
+.\SoundFocus.exe --no-tray             # headless: hotkeys only, no icon, no menu, no balloons
 .\SoundFocus.exe --list                # print what is making sound right now, then exit
 .\SoundFocus.exe --menu                # print what the tray menu would list
 .\SoundFocus.exe --debug               # raw per-session dump (devices / state / peak / pid)
@@ -85,6 +86,10 @@ an **in-app** shortcut. A global hotkey wins, so those editors will stop seeing 
 format code that way, pick something else with `--return-hotkey`.
 
 ## Tray
+
+`--no-tray` runs headless: the two hotkeys and nothing else — no icon, no menu, and the
+balloon notifications degrade to silence (they still go to `--log` if enabled). Since
+there is no Exit menu item, stop it with `taskkill /im SoundFocus.exe` or Task Manager.
 
 Left-click jumps, exactly like the hotkey. Right-click opens a menu that is **rebuilt every
 time it opens** — the list is only true at the moment it is shown.

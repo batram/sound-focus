@@ -1500,6 +1500,20 @@ namespace SoundFocus
         // "jump to the tab that is playing" extension shortcut
         static readonly Dictionary<string, int[]> sendKeys = new Dictionary<string, int[]>();
         static bool useTabs = true;
+        static bool noTray = false;
+
+        // Everything that talks through the tray icon goes through here, so headless mode
+        // (--no-tray) degrades to silence instead of a null reference.
+        static void Balloon(string text)
+        {
+            if (tray != null) tray.ShowBalloonTip(1500, "SoundFocus", text, ToolTipIcon.Info);
+            Log.Write("balloon: " + text);
+        }
+
+        static void TrayText(string text)
+        {
+            if (tray != null) tray.Text = Trim(text);
+        }
         static ContextMenuStrip menu;
         static string hotkeySpec = "";
         static string returnSpec = "";
@@ -1546,6 +1560,7 @@ namespace SoundFocus
                 else if (argv[i] == "--list") listOnly = true;
                 else if (argv[i] == "--debug") debug = true;
                 else if (argv[i] == "--no-tab") useTabs = false;
+                else if (argv[i] == "--no-tray") noTray = true;
                 else if (argv[i] == "--stress") stress = true;
                 else if (argv[i] == "--test-tab") testTab = true;
                 else if (argv[i] == "--menu") showMenu = true;
@@ -1561,7 +1576,7 @@ namespace SoundFocus
                 else if (argv[i] == "--help" || argv[i] == "-h")
                 {
                     MessageBox.Show("SoundFocus [--hotkey alt+shift+d] [--return-hotkey alt+shift+f]\n" +
-                        "           [--send exe=chord] [--list] [--menu] [--debug]\n\n" +
+                        "           [--no-tray] [--send exe=chord] [--list] [--menu] [--debug]\n\n" +
                         "Jumps to the window, or browser tab, currently making sound.\n" +
                         "Press the hotkey repeatedly to cycle through all noisy apps.\n\n" +
                         "The return hotkey goes back to where you were before that jump,\n" +
@@ -1732,50 +1747,53 @@ namespace SoundFocus
             returnSpec = returnHotkey;
 
 
-            menu = new ContextMenuStrip();
-            menu.Opening += BuildMenu;
-
-            // Build the items and force the window handle into existence now. A dropdown
-            // that is still empty and handle-less when Show is first called swallows that
-            // first Show: the Opening handler runs and fills it, but the display attempt
-            // is already lost, which is why only the second click ever worked.
-            BuildMenu(null, null);
-            IntPtr menuHandle = menu.Handle;
-            Log.Write("menu prepared: handle=" + menuHandle + " items=" + menu.Items.Count);
-
-            tray = new NotifyIcon();
-            tray.Icon = AppIcon();
-            tray.Text = Trim("SoundFocus - " + hotkey);
-            // Deliberately not tray.ContextMenuStrip: see ShowTrayMenu
-            tray.MouseDown += delegate(object s, MouseEventArgs me)
+            if (!noTray)
             {
-                Log.Write("tray MouseDown " + me.Button + " clicks=" + me.Clicks);
-            };
-            tray.MouseUp += delegate(object s, MouseEventArgs me)
-            {
-                Log.Write("tray MouseUp " + me.Button + " fg=" + Win.GetForegroundWindow());
-                if (me.Button == MouseButtons.Left) OnHotkey(null, null);
-                else if (me.Button == MouseButtons.Right) ShowTrayMenu();
-            };
-            tray.Click += delegate(object s, EventArgs ev) { Log.Write("tray Click"); };
+                menu = new ContextMenuStrip();
+                menu.Opening += BuildMenu;
 
-            menu.Opened += delegate { Log.Write("menu Opened, visible=" + menu.Visible); };
-            menu.Closing += delegate(object s, ToolStripDropDownClosingEventArgs ce)
-            {
-                Log.Write("menu Closing, reason=" + ce.CloseReason);
-            };
-            menu.Closed += delegate(object s, ToolStripDropDownClosedEventArgs ce)
-            {
-                Log.Write("menu Closed, reason=" + ce.CloseReason);
-            };
+                // Build the items and force the window handle into existence now. A dropdown
+                // that is still empty and handle-less when Show is first called swallows that
+                // first Show: the Opening handler runs and fills it, but the display attempt
+                // is already lost, which is why only the second click ever worked.
+                BuildMenu(null, null);
+                IntPtr menuHandle = menu.Handle;
+                Log.Write("menu prepared: handle=" + menuHandle + " items=" + menu.Items.Count);
 
-            tray.Visible = true;
-            Log.Write("tray visible, owner window=" + hk.Handle + ", hotkey=" + hotkey +
-                      ", return=" + returnHotkey);
+                tray = new NotifyIcon();
+                tray.Icon = AppIcon();
+                tray.Text = Trim("SoundFocus - " + hotkey);
+                // Deliberately not tray.ContextMenuStrip: see ShowTrayMenu
+                tray.MouseDown += delegate(object s, MouseEventArgs me)
+                {
+                    Log.Write("tray MouseDown " + me.Button + " clicks=" + me.Clicks);
+                };
+                tray.MouseUp += delegate(object s, MouseEventArgs me)
+                {
+                    Log.Write("tray MouseUp " + me.Button + " fg=" + Win.GetForegroundWindow());
+                    if (me.Button == MouseButtons.Left) OnHotkey(null, null);
+                    else if (me.Button == MouseButtons.Right) ShowTrayMenu();
+                };
+                tray.Click += delegate(object s, EventArgs ev) { Log.Write("tray Click"); };
+
+                menu.Opened += delegate { Log.Write("menu Opened, visible=" + menu.Visible); };
+                menu.Closing += delegate(object s, ToolStripDropDownClosingEventArgs ce)
+                {
+                    Log.Write("menu Closing, reason=" + ce.CloseReason);
+                };
+                menu.Closed += delegate(object s, ToolStripDropDownClosedEventArgs ce)
+                {
+                    Log.Write("menu Closed, reason=" + ce.CloseReason);
+                };
+
+                tray.Visible = true;
+            }
+            Log.Write((noTray ? "headless" : "tray visible") + ", owner window=" + hk.Handle +
+                      ", hotkey=" + hotkey + ", return=" + returnHotkey);
 
             Application.Run();
 
-            tray.Visible = false;
+            if (tray != null) tray.Visible = false;
             hk.Dispose();
             return 0;
         }
@@ -1935,7 +1953,7 @@ namespace SoundFocus
         {
             if (returnTo == IntPtr.Zero || !Win.IsWindow(returnTo))
             {
-                tray.ShowBalloonTip(1500, "SoundFocus", "Nowhere to go back to yet.", ToolTipIcon.Info);
+                Balloon("Nowhere to go back to yet.");
                 return;
             }
             IntPtr back = returnTo;
@@ -1973,8 +1991,8 @@ namespace SoundFocus
             List<Target> targets = ResolveTargets();
             if (targets.Count == 0)
             {
-                tray.ShowBalloonTip(1500, "SoundFocus", watcher.ActiveDevices == 0
-                    ? "No active playback device." : "Nothing is making sound.", ToolTipIcon.Info);
+                Balloon(watcher.ActiveDevices == 0
+                    ? "No active playback device." : "Nothing is making sound.");
                 return;
             }
 
@@ -1993,8 +2011,8 @@ namespace SoundFocus
             GoTo(targets[idx]);
 
             if (targets.Count > 1)
-                tray.Text = Trim("SoundFocus - " + targets[idx].Owner.Name +
-                                 " (" + (idx + 1) + "/" + targets.Count + ")");
+                TrayText("SoundFocus - " + targets[idx].Owner.Name +
+                         " (" + (idx + 1) + "/" + targets.Count + ")");
         }
 
         // "nothing is playing" and "you have no working speakers" look identical from
