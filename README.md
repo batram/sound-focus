@@ -4,6 +4,11 @@ Global hotkey that jumps to the window — or browser tab — of whatever app is
 making sound. Press it again to cycle through the others if more than one is noisy, and a
 second hotkey takes you back to what you were doing.
 
+- **Alt+Shift+D** — go to sound. 
+- **Alt+Shift+F** — go back to what was focused before
+
+- Default hotkeys can be changed via command-line arguments `--hotkey ctrl+alt+f9` `--return-hotkey ctrl+alt+f8`
+
 <p align="center">
   <img align="center" width="576" height="200" alt="image" src="https://github.com/user-attachments/assets/3112eda0-a85e-4335-a95f-76568e9d2771" />
 </p>
