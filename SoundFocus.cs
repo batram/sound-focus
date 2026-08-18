@@ -953,6 +953,12 @@ namespace SoundFocus
                     }
                     double t2 = sw.Elapsed.TotalMilliseconds;
 
+                    // Two passes, because the signals differ in strength. A tab that says
+                    // it is playing is stating a fact; a mute button only means the tab
+                    // can make sound - Firefox shows one while audible, but other apps
+                    // keep theirs after the sound stops, so it must never outrank a tab
+                    // that actually claims to be playing.
+                    Hit byButton = null;
                     foreach (AutomationElement tab in cached.CachedChildren)
                     {
                         string name;
@@ -964,17 +970,20 @@ namespace SoundFocus
                         catch { continue; }
                         tabCount++;
 
-                        if (IsAudibleCached(tab, name))
+                        if (SaysItIsPlaying(name))
                         {
                             found = NewHit(hwnd, tab, name);
                             break;
                         }
+                        if (byButton == null && HasAudioButton(tab))
+                            byButton = NewHit(hwnd, tab, name);
 
-                        // weaker fallback for browsers that expose no audio indicator
+                        // weakest fallback, for tab strips exposing no audio state at all
                         if (byTitle == null && !string.IsNullOrEmpty(mediaTitle) &&
                             name != null && name.ToLowerInvariant().IndexOf(mediaTitle.ToLowerInvariant()) >= 0)
                             byTitle = NewHit(hwnd, tab, name);
                     }
+                    if (found == null) found = byButton;
 
                     timing.Append("      window: strip " + (t1 - t0).ToString("N1") + " ms" +
                                   (cachedStrip ? " (cached)" : "") + ", fetch " +
@@ -1018,15 +1027,20 @@ namespace SoundFocus
             return keep == parts.Length ? title : string.Join(" - ", parts, 0, keep);
         }
 
+        // The strong signal: the tab's own name says so. Chromium writes "Audio playing"
+        // into it, and anything else can say the same to be found the same way.
+        static bool SaysItIsPlaying(string tabName)
+        {
+            return tabName != null && tabName.ToLowerInvariant().IndexOf("audio playing") >= 0;
+        }
+
+        // The weaker signal: a mute button on the tab. In Firefox it appears only while a
+        // tab is audible; elsewhere it may linger after the sound stops.
         // Reads only from the cache filled by the single bulk fetch: no round trips.
-        static bool IsAudibleCached(AutomationElement tab, string tabName)
+        static bool HasAudioButton(AutomationElement tab)
         {
             try
             {
-                // Chromium also spells the state into the tab's own name
-                if (tabName != null && tabName.ToLowerInvariant().IndexOf("audio playing") >= 0)
-                    return true;
-
                 foreach (AutomationElement c in tab.CachedChildren)
                 {
                     string n = c.Cached.Name;
@@ -1043,28 +1057,47 @@ namespace SoundFocus
 
         // The tab strip sits near the top of the chrome tree; a bounded walk keeps us out
         // of the page content, whose accessibility tree can be enormous.
-        static AutomationElement FindTabStrip(AutomationElement element, int depth)
+        const int MaxStripDepth = 12;
+        const int MaxStripNodes = 400;
+
+        // Breadth-first, because depth varies by application: a browser keeps its tab
+        // strip about four levels down in native chrome, while an Electron shell draws
+        // its tabs in HTML and buries them around nine. Searching by levels finds the
+        // shallow ones as fast as before without giving up on the deep ones, and the node
+        // budget is what keeps a window that has no tab strip cheap - the page content
+        // below is a tree we must never wander into.
+        static AutomationElement FindTabStrip(AutomationElement root, int unusedDepth)
         {
-            if (depth > 6) return null;
             try
             {
-                // One call per level with the control type cached, rather than a round
-                // trip per sibling through a TreeWalker.
                 CacheRequest cr = new CacheRequest();
                 cr.Add(AutomationElement.ControlTypeProperty);
                 cr.TreeScope = TreeScope.Element;
                 cr.AutomationElementMode = AutomationElementMode.Full;
 
-                AutomationElementCollection children;
-                using (cr.Activate())
-                    children = element.FindAll(TreeScope.Children, Condition.TrueCondition);
+                Queue<AutomationElement> queue = new Queue<AutomationElement>();
+                Queue<int> depths = new Queue<int>();
+                queue.Enqueue(root);
+                depths.Enqueue(0);
+                int visited = 0;
 
-                foreach (AutomationElement c in children)
-                    if (c.Cached.ControlType == ControlType.Tab) return c;
-                foreach (AutomationElement c in children)
+                while (queue.Count > 0 && visited < MaxStripNodes)
                 {
-                    AutomationElement found = FindTabStrip(c, depth + 1);
-                    if (found != null) return found;
+                    AutomationElement node = queue.Dequeue();
+                    int depth = depths.Dequeue();
+                    if (depth >= MaxStripDepth) continue;
+
+                    AutomationElementCollection children;
+                    using (cr.Activate())
+                        children = node.FindAll(TreeScope.Children, Condition.TrueCondition);
+
+                    foreach (AutomationElement c in children)
+                    {
+                        visited++;
+                        if (c.Cached.ControlType == ControlType.Tab) return c;
+                        queue.Enqueue(c);
+                        depths.Enqueue(depth + 1);
+                    }
                 }
             }
             catch { }

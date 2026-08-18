@@ -171,6 +171,31 @@ it works when the audible tab is a **background tab**, whose title never reaches
 title. Selecting it uses `SelectionItemPattern.Select()`, and Firefox raises that window on
 its own.
 
+Two signals, deliberately ranked. A tab whose accessible **name** contains *"Audio playing"*
+is stating a fact and wins outright. A **"Mute tab" button** on the tab only means the tab
+*can* make sound: Firefox shows one exactly while a tab is audible, but other apps keep
+theirs after the sound stops, so it must never outrank a tab that claims to be playing.
+
+### Making your own app discoverable
+
+Any app with tabs can be found the same way, with no cooperation from SoundFocus. Verified
+against an Electron app ([once](https://github.com/batram/once)) by doing exactly this:
+
+1. Mark the tab strip `role="tablist"` and each tab `role="tab"` — those surface as
+   `ControlType.Tab` and `TabItem`.
+2. When a tab is audible, put **`- Audio playing`** in its accessible name, matching
+   Chromium's wording: `aria-label="${title} - Audio playing"`. SoundFocus strips that
+   suffix again before showing the title.
+3. **Electron only:** call `app.setAccessibilitySupportEnabled(true)`. Chromium builds no
+   accessibility tree until asked, and unlike Chrome, Electron does not switch it on when a
+   client comes knocking — not even for a `WM_GETOBJECT` poke. Without it the window
+   exposes about fifteen nodes and nothing of the UI inside.
+
+The strip search is breadth-first to depth 12 with a 400-node budget, because depth varies
+by application: browsers keep their tab strip about four levels down in native chrome,
+while an Electron shell draws tabs in HTML and buries them around nine. Measured worst case
+for a window with no tab strip at all is ~100 ms, once, then cached.
+
 Safeguards, since this talks to another process:
 
 - The search runs on its own MTA thread with a hard timeout (2 s), so a busy browser can
