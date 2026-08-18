@@ -142,6 +142,33 @@ Safeguards, since this talks to another process:
 - Fallbacks in order: audible-tab button → tab whose title matches the now-playing title →
   window-title matching → plain window focus.
 
+### Keeping it fast
+
+Reaching into another process over UI Automation is slow enough to be felt in a menu that
+opens on right-click, so three things keep it off the critical path. Measured with three
+sources playing across several browser windows:
+
+| | |
+|---|---|
+| first scan, caches empty | 578 ms |
+| rescan, tab strips cached | 5 ms |
+| what the menu actually reads | 0 ms |
+
+- **One bulk fetch per tab strip.** A `CacheRequest` over the strip's subtree pulls every
+  tab name, control type and child in a single cross-process call. Walking it live with a
+  `TreeWalker` instead costs a round trip *per node*, which with a few dozen tabs is what
+  made the menu feel slow.
+- **The tab strip element is remembered per window** (60 s), including the fact that a
+  window has none — that negative result is what makes non-browser windows cheap to skip.
+  Locating a strip is a bounded tree walk costing ~60 ms per window, and after the bulk
+  fetch it was the whole remaining cost. A stale element (a window that rebuilt its chrome)
+  throws on use and is re-found once.
+- **The target list is resolved in the background** while anything is audible, and menu and
+  hotkey read that cache. Opening the menu does no UI Automation work at all in the normal
+  case; the trade is that the list can be up to ~2 s old.
+
+`--menu` prints these timings, so a regression here is visible rather than merely felt.
+
 `--mute-label "<text>"` sets the button label for non-English Firefox builds.
 `--no-tab` disables UI Automation entirely. `--test-tab` selects the playing tab without
 raising its window, which is handy for checking the mechanism in isolation.

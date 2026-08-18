@@ -5,6 +5,7 @@
 using System;
 using System.Collections;
 using System.ComponentModel;
+using System.Diagnostics;
 using System.Collections.Generic;
 using System.Drawing;
 using System.IO;
@@ -806,40 +807,141 @@ namespace SoundFocus
             return result;
         }
 
+        public static string LastTiming = "";
+
+        // Locating the tab strip means a bounded walk of the window's chrome, ~60 ms per
+        // window, and it dominates a scan once the bulk fetch removed the rest. A window
+        // keeps its tab strip for its whole life, so remember it - including the fact that
+        // a window has none, which is what makes non-browser windows cheap to skip.
+        class StripEntry
+        {
+            public AutomationElement Strip;   // null: this window has no tab strip
+            public long Stamp;
+        }
+
+        static readonly Dictionary<IntPtr, StripEntry> stripCache = new Dictionary<IntPtr, StripEntry>();
+        const int StripTtlMs = 60000;
+
+        static bool TryCachedStrip(IntPtr hwnd, out AutomationElement strip)
+        {
+            strip = null;
+            lock (stripCache)
+            {
+                StripEntry e;
+                if (!stripCache.TryGetValue(hwnd, out e)) return false;
+                if (Environment.TickCount - e.Stamp > StripTtlMs) { stripCache.Remove(hwnd); return false; }
+                strip = e.Strip;
+                return true;
+            }
+        }
+
+        static void RememberStrip(IntPtr hwnd, AutomationElement strip)
+        {
+            StripEntry e = new StripEntry();
+            e.Strip = strip;
+            e.Stamp = Environment.TickCount;
+            lock (stripCache)
+            {
+                if (stripCache.Count > 64) stripCache.Clear();   // closed windows, do not grow forever
+                stripCache[hwnd] = e;
+            }
+        }
+
+        static void ForgetStrip(IntPtr hwnd)
+        {
+            lock (stripCache) stripCache.Remove(hwnd);
+        }
+
         static Hit Search(List<IntPtr> windows, string mediaTitle)
         {
             Hit byTitle = null;
-            foreach (IntPtr hwnd in windows)
+            StringBuilder timing = new StringBuilder();
+            try
             {
-                AutomationElement win;
-                try { win = AutomationElement.FromHandle(hwnd); }
-                catch { continue; }
-                if (win == null) continue;
-
-                AutomationElement strip = FindTabStrip(win, 0);
-                if (strip == null) continue;
-
-                TreeWalker walker = TreeWalker.ControlViewWalker;
-                for (AutomationElement tab = walker.GetFirstChild(strip); tab != null;
-                     tab = walker.GetNextSibling(tab))
+                foreach (IntPtr hwnd in windows)
                 {
-                    string name;
+                    Stopwatch sw = Stopwatch.StartNew();
+                    double t0 = 0;
+                    AutomationElement win;
+                    try { win = AutomationElement.FromHandle(hwnd); }
+                    catch { continue; }
+                    if (win == null) continue;
+
+                    AutomationElement strip;
+                    bool cachedStrip = TryCachedStrip(hwnd, out strip);
+                    if (!cachedStrip)
+                    {
+                        strip = FindTabStrip(win, 0);
+                        RememberStrip(hwnd, strip);
+                    }
+                    double t1 = sw.Elapsed.TotalMilliseconds;
+                    if (strip == null)
+                    {
+                        timing.Append("      window: strip " + (t1 - t0).ToString("N1") + " ms" +
+                                      (cachedStrip ? " (cached)" : "") + ", none\r\n");
+                        continue;
+                    }
+
+                    // One cross-process call for the whole tab strip: names and control
+                    // types of every tab and of their children (the mute button). Walking
+                    // it live instead costs a round trip per node, which with a few dozen
+                    // tabs is what made opening the menu feel slow.
+                    int tabCount = 0;
+                    Hit found = null;
+                    CacheRequest cr = new CacheRequest();
+                    cr.Add(AutomationElement.NameProperty);
+                    cr.Add(AutomationElement.ControlTypeProperty);
+                    cr.TreeScope = TreeScope.Element | TreeScope.Descendants;
+                    cr.TreeFilter = Automation.ControlViewCondition;
+                    cr.AutomationElementMode = AutomationElementMode.Full;   // keep it selectable
+
+                    AutomationElement cached;
                     try
                     {
-                        if (tab.Current.ControlType != ControlType.TabItem) continue;
-                        name = tab.Current.Name;
+                        using (cr.Activate()) { cached = strip.GetUpdatedCache(cr); }
                     }
-                    catch { continue; }
+                    catch
+                    {
+                        // stale cached element (window rebuilt its chrome): re-find once
+                        ForgetStrip(hwnd);
+                        strip = FindTabStrip(win, 0);
+                        RememberStrip(hwnd, strip);
+                        if (strip == null) continue;
+                        using (cr.Activate()) { cached = strip.GetUpdatedCache(cr); }
+                    }
+                    double t2 = sw.Elapsed.TotalMilliseconds;
 
-                    if (IsAudible(tab, walker))
-                        return NewHit(hwnd, tab, name);
+                    foreach (AutomationElement tab in cached.CachedChildren)
+                    {
+                        string name;
+                        try
+                        {
+                            if (tab.Cached.ControlType != ControlType.TabItem) continue;
+                            name = tab.Cached.Name;
+                        }
+                        catch { continue; }
+                        tabCount++;
 
-                    // weaker fallback for browsers that expose no audio indicator
-                    if (byTitle == null && !string.IsNullOrEmpty(mediaTitle) &&
-                        name != null && name.ToLowerInvariant().IndexOf(mediaTitle.ToLowerInvariant()) >= 0)
-                        byTitle = NewHit(hwnd, tab, name);
+                        if (IsAudibleCached(tab, name))
+                        {
+                            found = NewHit(hwnd, tab, name);
+                            break;
+                        }
+
+                        // weaker fallback for browsers that expose no audio indicator
+                        if (byTitle == null && !string.IsNullOrEmpty(mediaTitle) &&
+                            name != null && name.ToLowerInvariant().IndexOf(mediaTitle.ToLowerInvariant()) >= 0)
+                            byTitle = NewHit(hwnd, tab, name);
+                    }
+
+                    timing.Append("      window: strip " + (t1 - t0).ToString("N1") + " ms" +
+                                  (cachedStrip ? " (cached)" : "") + ", fetch " +
+                                  (t2 - t1).ToString("N1") + " ms, " + tabCount + " tabs scanned " +
+                                  (sw.Elapsed.TotalMilliseconds - t2).ToString("N1") + " ms\r\n");
+                    if (found != null) return found;
                 }
             }
+            finally { LastTiming = timing.ToString(); }
             return byTitle;
         }
 
@@ -874,23 +976,24 @@ namespace SoundFocus
             return keep == parts.Length ? title : string.Join(" - ", parts, 0, keep);
         }
 
-        static bool IsAudible(AutomationElement tab, TreeWalker walker)
+        // Reads only from the cache filled by the single bulk fetch: no round trips.
+        static bool IsAudibleCached(AutomationElement tab, string tabName)
         {
             try
             {
-                for (AutomationElement c = walker.GetFirstChild(tab); c != null;
-                     c = walker.GetNextSibling(c))
+                // Chromium also spells the state into the tab's own name
+                if (tabName != null && tabName.ToLowerInvariant().IndexOf("audio playing") >= 0)
+                    return true;
+
+                foreach (AutomationElement c in tab.CachedChildren)
                 {
-                    string n = c.Current.Name;
+                    string n = c.Cached.Name;
                     if (n == null) continue;
                     n = n.ToLowerInvariant();
                     foreach (string label in MuteLabels)
                         if (n == label) return true;
-                    // Chrome puts the state in the tab's own name instead
                     if (n.IndexOf("audio playing") >= 0) return true;
                 }
-                string self = tab.Current.Name;
-                if (self != null && self.ToLowerInvariant().IndexOf("audio playing") >= 0) return true;
             }
             catch { }
             return false;
@@ -901,13 +1004,23 @@ namespace SoundFocus
         static AutomationElement FindTabStrip(AutomationElement element, int depth)
         {
             if (depth > 6) return null;
-            TreeWalker walker = TreeWalker.ControlViewWalker;
             try
             {
-                for (AutomationElement c = walker.GetFirstChild(element); c != null;
-                     c = walker.GetNextSibling(c))
+                // One call per level with the control type cached, rather than a round
+                // trip per sibling through a TreeWalker.
+                CacheRequest cr = new CacheRequest();
+                cr.Add(AutomationElement.ControlTypeProperty);
+                cr.TreeScope = TreeScope.Element;
+                cr.AutomationElementMode = AutomationElementMode.Full;
+
+                AutomationElementCollection children;
+                using (cr.Activate())
+                    children = element.FindAll(TreeScope.Children, Condition.TrueCondition);
+
+                foreach (AutomationElement c in children)
+                    if (c.Cached.ControlType == ControlType.Tab) return c;
+                foreach (AutomationElement c in children)
                 {
-                    if (c.Current.ControlType == ControlType.Tab) return c;
                     AutomationElement found = FindTabStrip(c, depth + 1);
                     if (found != null) return found;
                 }
@@ -1059,9 +1172,26 @@ namespace SoundFocus
                 for (int i = 0; i < 6; i++) { try { watcher.Tick(); } catch { } Thread.Sleep(150); }
                 Smtc.Refresh();
                 Console.Write("Playing now\r\n");
+                Stopwatch sw = Stopwatch.StartNew();
                 List<Target> ts = ResolveTargets();
+                double cold = sw.Elapsed.TotalMilliseconds;
                 if (ts.Count == 0) Console.Write("  " + EmptyReason() + "\r\n");
                 foreach (Target t in ts) Console.Write("  " + t.Label + "\r\n");
+
+                sw = Stopwatch.StartNew();
+                ResolveTargetsUncached();
+                double rescan = sw.Elapsed.TotalMilliseconds;
+                string rescanTiming = TabHunter.LastTiming;
+
+                sw = Stopwatch.StartNew();
+                ResolveTargets();
+                double warm = sw.Elapsed.TotalMilliseconds;
+
+                Console.Write("\r\nresolve: " + cold.ToString("N1") + " ms first scan, " +
+                              rescan.ToString("N1") + " ms rescan (tab strips cached), " +
+                              warm.ToString("N1") + " ms from target cache\r\n");
+                Console.Write(rescanTiming);
+                Console.Write("the tray menu reads the target cache, kept warm in the background\r\n");
                 return 0;
             }
 
@@ -1148,6 +1278,7 @@ namespace SoundFocus
             hk.Pressed += OnHotkey;
 
             watcher.Start();
+            StartPrewarm();
 
             hotkeySpec = hotkey;
             menu = new ContextMenuStrip();
@@ -1190,7 +1321,54 @@ namespace SoundFocus
             }
         }
 
+        static readonly object targetGate = new object();
+        static List<Target> targetCache = new List<Target>();
+        static long targetStamp;
+        const int TargetTtlMs = 2000;
+        const int PrewarmMs = 1500;
+
+        // Keeps the target list warm while anything is audible, so the cost is paid in the
+        // background instead of in the 200 ms after a right-click. Idle when silent.
+        static void StartPrewarm()
+        {
+            Thread t = new Thread(delegate()
+            {
+                while (true)
+                {
+                    try
+                    {
+                        if (watcher.Current().Count > 0) ResolveTargets();
+                    }
+                    catch { }
+                    Thread.Sleep(PrewarmMs);
+                }
+            });
+            t.IsBackground = true;
+            t.SetApartmentState(ApartmentState.MTA);
+            t.Start();
+        }
+
+        // Resolving means talking to other processes over UI Automation, which is far too
+        // slow to do while a menu is opening. The poller keeps this warm in the background,
+        // so opening the menu or hitting the hotkey normally just reads the last result.
         static List<Target> ResolveTargets()
+        {
+            lock (targetGate)
+            {
+                if (targetStamp != 0 && Environment.TickCount - targetStamp < TargetTtlMs)
+                    return targetCache;
+            }
+
+            List<Target> fresh = ResolveTargetsUncached();
+            lock (targetGate)
+            {
+                targetCache = fresh;
+                targetStamp = Environment.TickCount;
+            }
+            return fresh;
+        }
+
+        static List<Target> ResolveTargetsUncached()
         {
             List<Target> targets = new List<Target>();
             foreach (Noisy n in watcher.Current())
