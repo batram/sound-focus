@@ -79,7 +79,13 @@ format code that way, pick something else with `--return-hotkey`.
 ## Tray
 
 Left-click jumps, exactly like the hotkey. Right-click opens a menu that is **rebuilt every
-time it opens** — the list is only true at the moment it is shown:
+time it opens** — the list is only true at the moment it is shown.
+
+The menu is shown by hand rather than through `NotifyIcon.ContextMenuStrip`, taking the
+foreground first: left to itself, the first right-click merely activates the app and shows
+nothing, and only the second one opens the menu. A dummy message posted afterwards is the
+documented companion to that, without which the menu can refuse to close when you click
+away from it.
 
 ```
 Playing now
@@ -181,9 +187,15 @@ sources playing across several browser windows:
   Locating a strip is a bounded tree walk costing ~60 ms per window, and after the bulk
   fetch it was the whole remaining cost. A stale element (a window that rebuilt its chrome)
   throws on use and is re-found once.
-- **The target list is resolved in the background** while anything is audible, and menu and
-  hotkey read that cache. Opening the menu does no UI Automation work at all in the normal
-  case; the trade is that the list can be up to ~2 s old.
+- **The target list is resolved in the background**, and the menu reads that snapshot
+  without ever scanning while it opens — a menu that appears half a second after the click
+  reads as a click that did nothing. The trade is a list up to one refresh interval old.
+- **Endpoints are enumerated far less often than sessions.** Sessions come and go whenever
+  an app starts playing, but endpoints only change when hardware is plugged or unplugged,
+  and rebuilding them every couple of seconds was most of the idle cost: **2.7% → 1.7%** of
+  one core, prewarming included. A session reporting *expired* means its endpoint went away
+  underneath us, so that triggers an immediate re-enumeration instead of waiting out the
+  interval.
 
 `--menu` prints these timings, so a regression here is visible rather than merely felt.
 

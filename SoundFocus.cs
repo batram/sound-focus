@@ -146,7 +146,7 @@ namespace SoundFocus
     class AudioWatcher
     {
         const int RENDER = 0, DEVICE_STATE_ACTIVE = 1, CLSCTX_ALL = 23;
-        const int SESSION_ACTIVE = 1;
+        const int SESSION_ACTIVE = 1, SESSION_EXPIRED = 2;
 
         readonly object gate = new object();
         readonly Dictionary<int, Noisy> noisy = new Dictionary<int, Noisy>();
@@ -159,6 +159,10 @@ namespace SoundFocus
 
         long lastScan;
         int ticks;
+
+        List<IAudioSessionManager2> managers;   // one per active render endpoint
+        long lastDeviceScan;
+        const int DeviceRescanMs = 15000;
 
         public void Start()
         {
@@ -193,7 +197,14 @@ namespace SoundFocus
                 try
                 {
                     int state;
-                    if (s.GetState(out state) != 0 || state != SESSION_ACTIVE) continue;
+                    if (s.GetState(out state) != 0) continue;
+
+                    // An expired session means its endpoint went away underneath us -
+                    // headphones plugged in, default device switched - and the apps have
+                    // moved to an endpoint we are not watching. Re-enumerate immediately
+                    // rather than waiting out the endpoint interval.
+                    if (state == SESSION_EXPIRED) { managers = null; lastScan = 0; continue; }
+                    if (state != SESSION_ACTIVE) continue;
 
                     IAudioMeterInformation meter = s as IAudioMeterInformation;
                     if (meter == null) continue;
@@ -307,10 +318,45 @@ namespace SoundFocus
             sessions.Clear();
             ProcTree.Invalidate();
 
+            // Endpoints change when hardware is plugged or unplugged, which is rare, while
+            // sessions come and go whenever an app starts playing. Rebuilding the endpoint
+            // list and its session managers every couple of seconds was most of this
+            // program's idle cost, so only the session list is refreshed that often.
+            if (managers == null || Environment.TickCount - lastDeviceScan > DeviceRescanMs)
+                if (!RescanDevices()) return;
+
+            foreach (IAudioSessionManager2 mgr in managers)
+            {
+                try
+                {
+                    IAudioSessionEnumerator se;
+                    if (mgr.GetSessionEnumerator(out se) != 0) continue;
+                    int sc;
+                    se.GetCount(out sc);
+                    for (int j = 0; j < sc; j++)
+                    {
+                        IAudioSessionControl s;
+                        if (se.GetSession(j, out s) == 0 && s != null) sessions.Add(s);
+                    }
+                }
+                catch { managers = null; }   // endpoint went away: re-enumerate next tick
+            }
+        }
+
+        bool RescanDevices()
+        {
+            managers = new List<IAudioSessionManager2>();
+            lastDeviceScan = Environment.TickCount;
+
             IMMDeviceEnumerator devEnum = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
             IMMDeviceCollection devices;
             int hr = devEnum.EnumAudioEndpoints(RENDER, DEVICE_STATE_ACTIVE, out devices);
-            if (hr != 0) { LastScanNote = "EnumAudioEndpoints hr=0x" + hr.ToString("X8"); return; }
+            if (hr != 0)
+            {
+                LastScanNote = "EnumAudioEndpoints hr=0x" + hr.ToString("X8");
+                managers = null;
+                return false;
+            }
             int count;
             devices.GetCount(out count);
             ActiveDevices = count;
@@ -325,19 +371,11 @@ namespace SoundFocus
                     if (devices.Item(i, out dev) != 0) continue;
                     object o;
                     if (dev.Activate(ref iid, CLSCTX_ALL, IntPtr.Zero, out o) != 0) continue;
-                    IAudioSessionManager2 mgr = (IAudioSessionManager2)o;
-                    IAudioSessionEnumerator se;
-                    if (mgr.GetSessionEnumerator(out se) != 0) continue;
-                    int sc;
-                    se.GetCount(out sc);
-                    for (int j = 0; j < sc; j++)
-                    {
-                        IAudioSessionControl s;
-                        if (se.GetSession(j, out s) == 0 && s != null) sessions.Add(s);
-                    }
+                    managers.Add((IAudioSessionManager2)o);
                 }
                 catch { }
             }
+            return true;
         }
 
         // Processes audible within MemoryMs, oldest-first, so the cycle order is stable.
@@ -442,6 +480,9 @@ namespace SoundFocus
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetWindowText(IntPtr h, StringBuilder sb, int max);
         [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
         [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+        [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
+
+        public static void Raise(IntPtr h) { SetForegroundWindow(h); }
         [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
         [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
         [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
@@ -1295,7 +1336,7 @@ namespace SoundFocus
                 return 2;
             }
 
-            HotkeyWindow hk = new HotkeyWindow();
+            HotkeyWindow hk = hkWindow = new HotkeyWindow();
             if (!hk.Register(1, mods, vk))
             {
                 MessageBox.Show("Hotkey " + hotkey + " is already taken by another app.", "SoundFocus");
@@ -1325,10 +1366,11 @@ namespace SoundFocus
             tray = new NotifyIcon();
             tray.Icon = AppIcon();
             tray.Text = Trim("SoundFocus - " + hotkey);
-            tray.ContextMenuStrip = menu;
+            // Deliberately not tray.ContextMenuStrip: see ShowTrayMenu
             tray.MouseUp += delegate(object s, MouseEventArgs me)
             {
                 if (me.Button == MouseButtons.Left) OnHotkey(null, null);
+                else if (me.Button == MouseButtons.Right) ShowTrayMenu();
             };
             tray.Visible = true;
 
@@ -1373,10 +1415,10 @@ namespace SoundFocus
             {
                 while (true)
                 {
-                    try
-                    {
-                        if (watcher.Current().Count > 0) ResolveTargets();
-                    }
+                    // Unconditionally, and bypassing the read cache: when nothing is
+                    // audible this costs nothing, and it keeps the menu's snapshot at
+                    // most one interval old, including the moment audio starts.
+                    try { RefreshTargets(); }
                     catch { }
                     Thread.Sleep(PrewarmMs);
                 }
@@ -1396,7 +1438,11 @@ namespace SoundFocus
                 if (targetStamp != 0 && Environment.TickCount - targetStamp < TargetTtlMs)
                     return targetCache;
             }
+            return RefreshTargets();
+        }
 
+        static List<Target> RefreshTargets()
+        {
             List<Target> fresh = ResolveTargetsUncached();
             lock (targetGate)
             {
@@ -1404,6 +1450,16 @@ namespace SoundFocus
                 targetStamp = Environment.TickCount;
             }
             return fresh;
+        }
+
+        // What the menu uses: whatever is already known, never a scan. Opening a menu must
+        // not wait on other processes - a menu that appears half a second after the click
+        // reads as a click that did nothing.
+        static List<Target> TargetsNow()
+        {
+            List<Target> snapshot;
+            lock (targetGate) snapshot = targetCache;
+            return snapshot;
         }
 
         static List<Target> ResolveTargetsUncached()
@@ -1547,6 +1603,22 @@ namespace SoundFocus
             return s.Length <= 63 ? s : s.Substring(0, 62) + "…";
         }
 
+        static HotkeyWindow hkWindow;
+
+        // A tray menu misbehaves unless its owner is the foreground window: letting
+        // NotifyIcon show the menu itself means the first right-click only activates us
+        // and no menu appears, and the second one works. Showing it by hand after taking
+        // the foreground makes the first click behave like every later one.
+        //
+        // The dummy message posted afterwards is the documented companion to this: without
+        // it the menu can refuse to close when you click away from it.
+        static void ShowTrayMenu()
+        {
+            if (hkWindow != null) Win.Raise(hkWindow.Handle);
+            menu.Show(Cursor.Position);
+            if (hkWindow != null) Win.PostMessage(hkWindow.Handle, 0x0000 /*WM_NULL*/, IntPtr.Zero, IntPtr.Zero);
+        }
+
         // Rebuilt on every open: the list is only true at the moment it is shown.
         static void BuildMenu(object sender, CancelEventArgs e)
         {
@@ -1556,7 +1628,7 @@ namespace SoundFocus
             header.Enabled = false;
             menu.Items.Add(header);
 
-            List<Target> targets = ResolveTargets();
+            List<Target> targets = TargetsNow();
             if (targets.Count == 0)
             {
                 ToolStripMenuItem none = new ToolStripMenuItem(EmptyReason());
