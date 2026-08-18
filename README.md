@@ -239,6 +239,26 @@ sources playing across several browser windows:
 
 `--menu` prints these timings, so a regression here is visible rather than merely felt.
 
+### Memory: nothing waits for the garbage collector
+
+Every UI Automation element, audio-session object and device enumerator is released the
+moment it has been read — `Marshal.FinalReleaseComObject`, not the GC. This is not
+optional hygiene here but the difference between 40 MB and gigabytes: each element is a
+tiny managed wrapper around a native cross-process proxy and cached property store, so
+thousands of them exert no pressure on a GC that only weighs managed bytes. It simply
+never collects, while the native side balloons. Measured on a long-running instance:
+**233 MB private memory, of which the managed heap was 1.3 MB** — with 2,132 dead elements
+sitting in the finalization queue.
+
+For the same reason the tab hunt uses the raw `IUIAutomation` COM interface rather than
+`System.Windows.Automation`: the managed wrapper offers no way to release an element
+explicitly, and it drags in ~20 MB of WPF (`PresentationCore`/`WindowsBase`) besides.
+After the change, a stress run at 15–20× normal polling holds flat around 38 MB with a
+finalization queue of single digits.
+
+`--stress` runs every loop at that accelerated rate, so an hour of drift shows up in a
+minute — that flat line is checkable, not folklore.
+
 `--mute-label "<text>"` sets the button label for non-English Firefox builds.
 `--no-tab` disables UI Automation entirely. `--test-tab` selects the playing tab without
 raising its window, which is handy for checking the mechanism in isolation.

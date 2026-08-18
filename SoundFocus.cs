@@ -14,7 +14,7 @@ using System.Reflection;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
-using System.Windows.Automation;
+
 using System.Windows.Forms;
 
 namespace SoundFocus
@@ -307,14 +307,28 @@ namespace SoundFocus
                     d.GetState(out st);
                     d.GetId(out id);
                     sb.Append("    state=" + st + "  " + id + "\r\n");
+                    ComRelease(d);
                 }
+                ComRelease(all);
+                ComRelease(de);
             }
             catch (Exception ex) { sb.Append("  <device dump error " + ex.Message + ">\r\n"); }
             return sb.ToString();
         }
 
+        // COM objects here are refetched on a schedule, so every replaced one is released
+        // on the spot. Relying on the GC instead lets native proxies pile up unseen: the
+        // managed wrappers are so small that collections almost never run.
+        static void ComRelease(object com)
+        {
+            if (com == null) return;
+            try { Marshal.FinalReleaseComObject(com); }
+            catch { }
+        }
+
         void RescanSessions()
         {
+            foreach (IAudioSessionControl old in sessions) ComRelease(old);
             sessions.Clear();
             ProcTree.Invalidate();
 
@@ -331,13 +345,17 @@ namespace SoundFocus
                 {
                     IAudioSessionEnumerator se;
                     if (mgr.GetSessionEnumerator(out se) != 0) continue;
-                    int sc;
-                    se.GetCount(out sc);
-                    for (int j = 0; j < sc; j++)
+                    try
                     {
-                        IAudioSessionControl s;
-                        if (se.GetSession(j, out s) == 0 && s != null) sessions.Add(s);
+                        int sc;
+                        se.GetCount(out sc);
+                        for (int j = 0; j < sc; j++)
+                        {
+                            IAudioSessionControl s;
+                            if (se.GetSession(j, out s) == 0 && s != null) sessions.Add(s);
+                        }
                     }
+                    finally { ComRelease(se); }
                 }
                 catch { managers = null; }   // endpoint went away: re-enumerate next tick
             }
@@ -345,37 +363,48 @@ namespace SoundFocus
 
         bool RescanDevices()
         {
+            if (managers != null)
+                foreach (IAudioSessionManager2 old in managers) ComRelease(old);
             managers = new List<IAudioSessionManager2>();
             lastDeviceScan = Environment.TickCount;
 
             IMMDeviceEnumerator devEnum = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
-            IMMDeviceCollection devices;
-            int hr = devEnum.EnumAudioEndpoints(RENDER, DEVICE_STATE_ACTIVE, out devices);
-            if (hr != 0)
+            IMMDeviceCollection devices = null;
+            try
             {
-                LastScanNote = "EnumAudioEndpoints hr=0x" + hr.ToString("X8");
-                managers = null;
-                return false;
-            }
-            int count;
-            devices.GetCount(out count);
-            ActiveDevices = count;
-            LastScanNote = "active render devices: " + count;
-
-            Guid iid = typeof(IAudioSessionManager2).GUID;
-            for (int i = 0; i < count; i++)
-            {
-                try
+                int hr = devEnum.EnumAudioEndpoints(RENDER, DEVICE_STATE_ACTIVE, out devices);
+                if (hr != 0)
                 {
-                    IMMDevice dev;
-                    if (devices.Item(i, out dev) != 0) continue;
-                    object o;
-                    if (dev.Activate(ref iid, CLSCTX_ALL, IntPtr.Zero, out o) != 0) continue;
-                    managers.Add((IAudioSessionManager2)o);
+                    LastScanNote = "EnumAudioEndpoints hr=0x" + hr.ToString("X8");
+                    managers = null;
+                    return false;
                 }
-                catch { }
+                int count;
+                devices.GetCount(out count);
+                ActiveDevices = count;
+                LastScanNote = "active render devices: " + count;
+
+                Guid iid = typeof(IAudioSessionManager2).GUID;
+                for (int i = 0; i < count; i++)
+                {
+                    IMMDevice dev = null;
+                    try
+                    {
+                        if (devices.Item(i, out dev) != 0) continue;
+                        object o;
+                        if (dev.Activate(ref iid, CLSCTX_ALL, IntPtr.Zero, out o) != 0) continue;
+                        managers.Add((IAudioSessionManager2)o);
+                    }
+                    catch { }
+                    finally { ComRelease(dev); }
+                }
+                return true;
             }
-            return true;
+            finally
+            {
+                ComRelease(devices);
+                ComRelease(devEnum);
+            }
         }
 
         // Processes audible within MemoryMs, oldest-first, so the cycle order is stable.
@@ -685,6 +714,13 @@ namespace SoundFocus
 
         const string WinMdSuffix = ", Windows.Media.Control, ContentType=WindowsRuntime";
 
+        static void BestEffortRelease(object o)
+        {
+            if (o == null) return;
+            try { Marshal.ReleaseComObject(o); }
+            catch { }
+        }
+
         static object Await(object asyncOp, Type resultType)
         {
             Type ext = Type.GetType("System.WindowsRuntimeSystemExtensions, System.Runtime.WindowsRuntime, " +
@@ -727,22 +763,33 @@ namespace SoundFocus
                 object sessions = mgr.GetType().GetMethod("GetSessions").Invoke(mgr, null);
                 foreach (object s in (IEnumerable)sessions)
                 {
+                    object info = null, props = null;
                     try
                     {
-                        object info = s.GetType().GetMethod("GetPlaybackInfo").Invoke(s, null);
+                        info = s.GetType().GetMethod("GetPlaybackInfo").Invoke(s, null);
                         object status = info.GetType().GetProperty("PlaybackStatus").GetValue(info, null);
                         if (status.ToString() != "Playing") continue;
 
                         string app = (string)s.GetType().GetProperty("SourceAppUserModelId").GetValue(s, null);
-                        object props = Await(s.GetType().GetMethod("TryGetMediaPropertiesAsync").Invoke(s, null),
-                                             propsType);
+                        props = Await(s.GetType().GetMethod("TryGetMediaPropertiesAsync").Invoke(s, null),
+                                      propsType);
                         if (props == null) continue;
                         string title = (string)props.GetType().GetProperty("Title").GetValue(props, null);
                         string artist = (string)props.GetType().GetProperty("Artist").GetValue(props, null);
                         fresh.Add(new string[] { app, title, artist });
                     }
                     catch { }
+                    finally
+                    {
+                        // WinRT projections wrap COM too; only the strings are kept.
+                        // Best effort: a projection that refuses to release just waits
+                        // for its finalizer like before.
+                        BestEffortRelease(props);
+                        BestEffortRelease(info);
+                        BestEffortRelease(s);
+                    }
                 }
+                BestEffortRelease(sessions);
                 lock (gate) cache = fresh;
             }
             catch { mgr = null; }
@@ -813,14 +860,124 @@ namespace SoundFocus
 
     #endregion
 
-    #region Tab hunting (UI Automation)
+    #region Tab hunting (UI Automation, raw COM)
+
+    // The raw COM interface, not System.Windows.Automation. The managed wrapper hides
+    // every native element behind a GC-owned object with no Dispose, so cross-process
+    // proxies and cached property stores pile up until a full collection happens to run -
+    // hundreds of megabytes of native memory the GC cannot see and will not chase. Here
+    // every element is released the moment it has been read. The wrapper also drags in
+    // PresentationCore and WindowsBase (WPF), which this drops from the process.
+    //
+    // Vtable order of the interop declarations is load-bearing: methods are called by
+    // slot, so each interface must list every method in IDL order up to the last one
+    // used, including ones this program never calls.
+    [ComImport, Guid("FF48DBA4-60EF-4201-AA87-54103EEF594E")]
+    class CUIAutomationComObject { }
+
+    [ComImport, Guid("30CBE57D-D9D0-452A-AB13-7AC5AC4825EE"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IUIAutomation
+    {
+        [PreserveSig] int CompareElements(IUIAutomationElement a, IUIAutomationElement b, out int same);
+        [PreserveSig] int CompareRuntimeIds(IntPtr a, IntPtr b, out int same);
+        [PreserveSig] int GetRootElement(out IUIAutomationElement root);
+        [PreserveSig] int ElementFromHandle(IntPtr hwnd, out IUIAutomationElement element);
+        [PreserveSig] int ElementFromPoint(long pt, out IUIAutomationElement element);
+        [PreserveSig] int GetFocusedElement(out IUIAutomationElement element);
+        [PreserveSig] int GetRootElementBuildCache(IUIAutomationCacheRequest cr, out IUIAutomationElement root);
+        [PreserveSig] int ElementFromHandleBuildCache(IntPtr hwnd, IUIAutomationCacheRequest cr, out IUIAutomationElement element);
+        [PreserveSig] int ElementFromPointBuildCache(long pt, IUIAutomationCacheRequest cr, out IUIAutomationElement element);
+        [PreserveSig] int GetFocusedElementBuildCache(IUIAutomationCacheRequest cr, out IUIAutomationElement element);
+        [PreserveSig] int CreateTreeWalker(IUIAutomationCondition cond, out IntPtr walker);
+        [PreserveSig] int get_ControlViewWalker(out IntPtr walker);
+        [PreserveSig] int get_ContentViewWalker(out IntPtr walker);
+        [PreserveSig] int get_RawViewWalker(out IntPtr walker);
+        [PreserveSig] int get_RawViewCondition(out IUIAutomationCondition cond);
+        [PreserveSig] int get_ControlViewCondition(out IUIAutomationCondition cond);
+        [PreserveSig] int get_ContentViewCondition(out IUIAutomationCondition cond);
+        [PreserveSig] int CreateCacheRequest(out IUIAutomationCacheRequest cr);
+        [PreserveSig] int CreateTrueCondition(out IUIAutomationCondition cond);
+    }
+
+    [ComImport, Guid("D22108AA-8AC5-49A5-837B-37BBB3D7591E"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IUIAutomationElement
+    {
+        [PreserveSig] int SetFocus();
+        [PreserveSig] int GetRuntimeId(out IntPtr runtimeId);
+        [PreserveSig] int FindFirst(int scope, IUIAutomationCondition cond, out IUIAutomationElement found);
+        [PreserveSig] int FindAll(int scope, IUIAutomationCondition cond, out IUIAutomationElementArray found);
+        [PreserveSig] int FindFirstBuildCache(int scope, IUIAutomationCondition cond, IUIAutomationCacheRequest cr, out IUIAutomationElement found);
+        [PreserveSig] int FindAllBuildCache(int scope, IUIAutomationCondition cond, IUIAutomationCacheRequest cr, out IUIAutomationElementArray found);
+        [PreserveSig] int BuildUpdatedCache(IUIAutomationCacheRequest cr, out IUIAutomationElement updated);
+        [PreserveSig] int GetCurrentPropertyValue(int propertyId, out object value);
+        [PreserveSig] int GetCurrentPropertyValueEx(int propertyId, int ignoreDefault, out object value);
+        [PreserveSig] int GetCachedPropertyValue(int propertyId, out object value);
+        [PreserveSig] int GetCachedPropertyValueEx(int propertyId, int ignoreDefault, out object value);
+        [PreserveSig] int GetCurrentPatternAs(int patternId, ref Guid riid, out IntPtr pattern);
+        [PreserveSig] int GetCachedPatternAs(int patternId, ref Guid riid, out IntPtr pattern);
+        [PreserveSig] int GetCurrentPattern(int patternId, [MarshalAs(UnmanagedType.IUnknown)] out object pattern);
+        [PreserveSig] int GetCachedPattern(int patternId, [MarshalAs(UnmanagedType.IUnknown)] out object pattern);
+        [PreserveSig] int GetCachedParent(out IUIAutomationElement parent);
+        [PreserveSig] int GetCachedChildren(out IUIAutomationElementArray children);
+    }
+
+    [ComImport, Guid("B32A92B5-BC25-4078-9C08-D7EE95C48E03"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IUIAutomationCacheRequest
+    {
+        [PreserveSig] int AddProperty(int propertyId);
+        [PreserveSig] int AddPattern(int patternId);
+        [PreserveSig] int Clone(out IUIAutomationCacheRequest clone);
+        [PreserveSig] int get_TreeScope(out int scope);
+        [PreserveSig] int put_TreeScope(int scope);
+        [PreserveSig] int get_TreeFilter(out IUIAutomationCondition filter);
+        [PreserveSig] int put_TreeFilter(IUIAutomationCondition filter);
+        [PreserveSig] int get_AutomationElementMode(out int mode);
+        [PreserveSig] int put_AutomationElementMode(int mode);
+    }
+
+    [ComImport, Guid("14314595-B4BC-4055-95F2-58F2E42C9855"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IUIAutomationElementArray
+    {
+        [PreserveSig] int get_Length(out int length);
+        [PreserveSig] int GetElement(int index, out IUIAutomationElement element);
+    }
+
+    [ComImport, Guid("352FFBA8-0973-437C-A61F-F64CAFD81DF9"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IUIAutomationCondition { }
+
+    [ComImport, Guid("A8EFA66A-0FDA-421A-9194-38021F3578EA"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IUIAutomationSelectionItemPattern
+    {
+        [PreserveSig] int Select();
+    }
+
+    [ComImport, Guid("FB377FBE-8EA6-46D5-9C73-6499642D3059"),
+     InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
+    interface IUIAutomationInvokePattern
+    {
+        [PreserveSig] int Invoke();
+    }
 
     // Tabs are not windows, so Win32 cannot reach them - but browsers expose their tab
-    // strip through UI Automation, and Firefox gives the playing tab a child button
-    // named "Mute tab". That is a direct signal: it does not depend on the tab title,
-    // and it works for background tabs, which title matching cannot see.
+    // strip through UI Automation, and the playing tab is marked: Firefox gives it a
+    // child button named "Mute tab", Chromium writes "Audio playing" into its name.
+    // Works for background tabs, which title matching cannot see.
     static class TabHunter
     {
+        const int UIA_ControlTypePropertyId = 30003;
+        const int UIA_NamePropertyId = 30005;
+        const int UIA_TabControlTypeId = 50018;
+        const int UIA_TabItemControlTypeId = 50019;
+        const int UIA_SelectionItemPatternId = 10010;
+        const int UIA_InvokePatternId = 10000;
+        const int TreeScope_Element = 1, TreeScope_Children = 2, TreeScope_Descendants = 4;
+
         // Localised button label on an audible tab. A muted tab says "Unmute tab" and is
         // deliberately not matched - a muted tab is not making any sound.
         public static string[] MuteLabels = { "mute tab" };
@@ -828,8 +985,122 @@ namespace SoundFocus
         public class Hit
         {
             public IntPtr Window;
-            public AutomationElement Tab;
+            public IUIAutomationElement Tab;   // owned; freed via Dispose
             public string Title;
+
+            public void Dispose()
+            {
+                IUIAutomationElement t = Tab;
+                Tab = null;
+                Release(t);
+            }
+        }
+
+        // One automation instance and one pre-built cache request per hunting thread.
+        [ThreadStatic] static IUIAutomation uia;
+        [ThreadStatic] static IUIAutomationCacheRequest stripFetch;   // subtree: names + types
+        [ThreadStatic] static IUIAutomationCacheRequest childScan;    // children: types only
+
+        static void Release(object com)
+        {
+            if (com == null) return;
+            try { Marshal.FinalReleaseComObject(com); }
+            catch { }
+        }
+
+        static IUIAutomation Uia()
+        {
+            if (uia != null) return uia;
+            uia = (IUIAutomation)new CUIAutomationComObject();
+
+            IUIAutomationCondition view;
+            uia.get_ControlViewCondition(out view);
+
+            uia.CreateCacheRequest(out stripFetch);
+            stripFetch.AddProperty(UIA_ControlTypePropertyId);
+            stripFetch.AddProperty(UIA_NamePropertyId);
+            stripFetch.put_TreeScope(TreeScope_Element | TreeScope_Descendants);
+            stripFetch.put_TreeFilter(view);
+
+            uia.CreateCacheRequest(out childScan);
+            childScan.AddProperty(UIA_ControlTypePropertyId);
+            childScan.put_TreeScope(TreeScope_Element);
+            childScan.put_TreeFilter(view);
+            return uia;
+        }
+
+        static int CachedInt(IUIAutomationElement e, int prop)
+        {
+            object v;
+            if (e.GetCachedPropertyValue(prop, out v) != 0 || !(v is int)) return 0;
+            return (int)v;
+        }
+
+        static string CachedString(IUIAutomationElement e, int prop)
+        {
+            object v;
+            if (e.GetCachedPropertyValue(prop, out v) != 0) return null;
+            return v as string;
+        }
+
+        public static string LastTiming = "";
+
+        // Locating the tab strip means a walk of the window's chrome; a window keeps its
+        // strip for its whole life, so remember it - including that a window has none,
+        // which is what keeps non-browser windows cheap. Cached elements are owned here
+        // and released on eviction.
+        class StripEntry
+        {
+            public IUIAutomationElement Strip;   // null: no tab strip in this window
+            public long Stamp;
+        }
+
+        static readonly Dictionary<IntPtr, StripEntry> stripCache = new Dictionary<IntPtr, StripEntry>();
+        const int StripTtlMs = 60000;
+
+        static bool TryCachedStrip(IntPtr hwnd, out IUIAutomationElement strip)
+        {
+            strip = null;
+            lock (stripCache)
+            {
+                StripEntry e;
+                if (!stripCache.TryGetValue(hwnd, out e)) return false;
+                if (Environment.TickCount - e.Stamp > StripTtlMs)
+                {
+                    stripCache.Remove(hwnd);
+                    Release(e.Strip);
+                    return false;
+                }
+                strip = e.Strip;
+                return true;
+            }
+        }
+
+        static void RememberStrip(IntPtr hwnd, IUIAutomationElement strip)
+        {
+            StripEntry e = new StripEntry();
+            e.Strip = strip;
+            e.Stamp = Environment.TickCount;
+            lock (stripCache)
+            {
+                StripEntry old;
+                if (stripCache.TryGetValue(hwnd, out old)) Release(old.Strip);
+                if (stripCache.Count > 64)
+                {
+                    foreach (StripEntry s in stripCache.Values) Release(s.Strip);
+                    stripCache.Clear();
+                }
+                stripCache[hwnd] = e;
+            }
+        }
+
+        static void ForgetStrip(IntPtr hwnd)
+        {
+            lock (stripCache)
+            {
+                StripEntry e;
+                if (stripCache.TryGetValue(hwnd, out e)) { stripCache.Remove(hwnd); Release(e.Strip); }
+            }
         }
 
         // Runs the search on its own MTA thread with a hard timeout: UI Automation talks
@@ -837,166 +1108,145 @@ namespace SoundFocus
         public static Hit Find(List<IntPtr> windows, string mediaTitle, int timeoutMs)
         {
             Hit result = null;
+            bool[] abandoned = { false };
             Thread t = new Thread(delegate()
             {
-                try { result = Search(windows, mediaTitle); }
+                try
+                {
+                    Hit h = Search(windows, mediaTitle);
+                    lock (abandoned)
+                    {
+                        // the caller gave up waiting: nobody will ever dispose this
+                        if (abandoned[0]) { if (h != null) h.Dispose(); }
+                        else result = h;
+                    }
+                }
                 catch { }
             });
             t.IsBackground = true;
             t.SetApartmentState(ApartmentState.MTA);
             t.Start();
-            t.Join(timeoutMs);
+            if (!t.Join(timeoutMs))
+                lock (abandoned) abandoned[0] = true;
             return result;
-        }
-
-        public static string LastTiming = "";
-
-        // Locating the tab strip means a bounded walk of the window's chrome, ~60 ms per
-        // window, and it dominates a scan once the bulk fetch removed the rest. A window
-        // keeps its tab strip for its whole life, so remember it - including the fact that
-        // a window has none, which is what makes non-browser windows cheap to skip.
-        class StripEntry
-        {
-            public AutomationElement Strip;   // null: this window has no tab strip
-            public long Stamp;
-        }
-
-        static readonly Dictionary<IntPtr, StripEntry> stripCache = new Dictionary<IntPtr, StripEntry>();
-        const int StripTtlMs = 60000;
-
-        static bool TryCachedStrip(IntPtr hwnd, out AutomationElement strip)
-        {
-            strip = null;
-            lock (stripCache)
-            {
-                StripEntry e;
-                if (!stripCache.TryGetValue(hwnd, out e)) return false;
-                if (Environment.TickCount - e.Stamp > StripTtlMs) { stripCache.Remove(hwnd); return false; }
-                strip = e.Strip;
-                return true;
-            }
-        }
-
-        static void RememberStrip(IntPtr hwnd, AutomationElement strip)
-        {
-            StripEntry e = new StripEntry();
-            e.Strip = strip;
-            e.Stamp = Environment.TickCount;
-            lock (stripCache)
-            {
-                if (stripCache.Count > 64) stripCache.Clear();   // closed windows, do not grow forever
-                stripCache[hwnd] = e;
-            }
-        }
-
-        static void ForgetStrip(IntPtr hwnd)
-        {
-            lock (stripCache) stripCache.Remove(hwnd);
         }
 
         static Hit Search(List<IntPtr> windows, string mediaTitle)
         {
-            Hit byTitle = null;
+            Hit byTitle = null, byButton = null;
             StringBuilder timing = new StringBuilder();
             try
             {
+                IUIAutomation au = Uia();
                 foreach (IntPtr hwnd in windows)
                 {
                     Stopwatch sw = Stopwatch.StartNew();
-                    double t0 = 0;
-                    AutomationElement win;
-                    try { win = AutomationElement.FromHandle(hwnd); }
-                    catch { continue; }
-                    if (win == null) continue;
-
-                    AutomationElement strip;
+                    IUIAutomationElement strip;
                     bool cachedStrip = TryCachedStrip(hwnd, out strip);
                     if (!cachedStrip)
                     {
-                        strip = FindTabStrip(win, 0);
+                        strip = FindTabStrip(au, hwnd);
                         RememberStrip(hwnd, strip);
                     }
                     double t1 = sw.Elapsed.TotalMilliseconds;
                     if (strip == null)
                     {
-                        timing.Append("      window: strip " + (t1 - t0).ToString("N1") + " ms" +
+                        timing.Append("      window: strip " + t1.ToString("N1") + " ms" +
                                       (cachedStrip ? " (cached)" : "") + ", none\r\n");
                         continue;
                     }
 
                     // One cross-process call for the whole tab strip: names and control
                     // types of every tab and of their children (the mute button). Walking
-                    // it live instead costs a round trip per node, which with a few dozen
-                    // tabs is what made opening the menu feel slow.
-                    int tabCount = 0;
-                    Hit found = null;
-                    CacheRequest cr = new CacheRequest();
-                    cr.Add(AutomationElement.NameProperty);
-                    cr.Add(AutomationElement.ControlTypeProperty);
-                    cr.TreeScope = TreeScope.Element | TreeScope.Descendants;
-                    cr.TreeFilter = Automation.ControlViewCondition;
-                    cr.AutomationElementMode = AutomationElementMode.Full;   // keep it selectable
-
-                    AutomationElement cached;
-                    try
-                    {
-                        using (cr.Activate()) { cached = strip.GetUpdatedCache(cr); }
-                    }
-                    catch
+                    // it live instead costs a round trip per node.
+                    IUIAutomationElement snapshot;
+                    if (strip.BuildUpdatedCache(stripFetch, out snapshot) != 0 || snapshot == null)
                     {
                         // stale cached element (window rebuilt its chrome): re-find once
                         ForgetStrip(hwnd);
-                        strip = FindTabStrip(win, 0);
+                        strip = FindTabStrip(au, hwnd);
                         RememberStrip(hwnd, strip);
                         if (strip == null) continue;
-                        using (cr.Activate()) { cached = strip.GetUpdatedCache(cr); }
+                        if (strip.BuildUpdatedCache(stripFetch, out snapshot) != 0 || snapshot == null)
+                            continue;
                     }
                     double t2 = sw.Elapsed.TotalMilliseconds;
 
-                    // Two passes, because the signals differ in strength. A tab that says
-                    // it is playing is stating a fact; a mute button only means the tab
-                    // can make sound - Firefox shows one while audible, but other apps
-                    // keep theirs after the sound stops, so it must never outrank a tab
-                    // that actually claims to be playing.
-                    Hit byButton = null;
-                    foreach (AutomationElement tab in cached.CachedChildren)
+                    // Everything below reads the snapshot; the one element that leaves
+                    // this scope alive is the winning tab inside a Hit.
+                    int tabCount = 0;
+                    Hit found = null;
+                    IUIAutomationElementArray tabs;
+                    if (snapshot.GetCachedChildren(out tabs) == 0 && tabs != null)
                     {
-                        string name;
-                        try
+                        int n;
+                        tabs.get_Length(out n);
+                        for (int i = 0; i < n; i++)
                         {
-                            if (tab.Cached.ControlType != ControlType.TabItem) continue;
-                            name = tab.Cached.Name;
-                        }
-                        catch { continue; }
-                        tabCount++;
+                            IUIAutomationElement tab;
+                            if (tabs.GetElement(i, out tab) != 0 || tab == null) continue;
+                            bool keepTab = false;
+                            try
+                            {
+                                if (CachedInt(tab, UIA_ControlTypePropertyId) != UIA_TabItemControlTypeId)
+                                    continue;
+                                tabCount++;
+                                string name = CachedString(tab, UIA_NamePropertyId);
 
-                        if (SaysItIsPlaying(name))
-                        {
-                            found = NewHit(hwnd, tab, name);
-                            break;
+                                // Two signals, ranked. A tab whose name says it is playing
+                                // is stating a fact; a mute button only means the tab can
+                                // make sound - Firefox shows one while audible, but other
+                                // apps keep theirs after the sound stops.
+                                if (SaysItIsPlaying(name))
+                                {
+                                    found = NewHit(hwnd, tab, name);
+                                    keepTab = true;
+                                    break;
+                                }
+                                if (byButton == null && HasAudioButton(tab))
+                                {
+                                    byButton = NewHit(hwnd, tab, name);
+                                    keepTab = true;
+                                    continue;
+                                }
+                                // weakest fallback, for strips exposing no audio state
+                                if (byTitle == null && !string.IsNullOrEmpty(mediaTitle) &&
+                                    name != null &&
+                                    name.ToLowerInvariant().IndexOf(mediaTitle.ToLowerInvariant()) >= 0)
+                                {
+                                    byTitle = NewHit(hwnd, tab, name);
+                                    keepTab = true;
+                                }
+                            }
+                            finally { if (!keepTab) Release(tab); }
                         }
-                        if (byButton == null && HasAudioButton(tab))
-                            byButton = NewHit(hwnd, tab, name);
-
-                        // weakest fallback, for tab strips exposing no audio state at all
-                        if (byTitle == null && !string.IsNullOrEmpty(mediaTitle) &&
-                            name != null && name.ToLowerInvariant().IndexOf(mediaTitle.ToLowerInvariant()) >= 0)
-                            byTitle = NewHit(hwnd, tab, name);
+                        Release(tabs);
                     }
-                    if (found == null) found = byButton;
+                    Release(snapshot);
 
-                    timing.Append("      window: strip " + (t1 - t0).ToString("N1") + " ms" +
+                    timing.Append("      window: strip " + t1.ToString("N1") + " ms" +
                                   (cachedStrip ? " (cached)" : "") + ", fetch " +
                                   (t2 - t1).ToString("N1") + " ms, " + tabCount + " tabs scanned " +
                                   (sw.Elapsed.TotalMilliseconds - t2).ToString("N1") + " ms\r\n");
-                    if (found != null) return found;
+                    if (found != null)
+                    {
+                        if (byButton != null && byButton != found) byButton.Dispose();
+                        if (byTitle != null && byTitle != found) byTitle.Dispose();
+                        return found;
+                    }
                 }
             }
             finally { LastTiming = timing.ToString(); }
+
+            if (byButton != null)
+            {
+                if (byTitle != null) byTitle.Dispose();
+                return byButton;
+            }
             return byTitle;
         }
 
-        static Hit NewHit(IntPtr hwnd, AutomationElement tab, string title)
+        static Hit NewHit(IntPtr hwnd, IUIAutomationElement tab, string title)
         {
             Hit h = new Hit();
             h.Window = hwnd;
@@ -1034,74 +1284,110 @@ namespace SoundFocus
             return tabName != null && tabName.ToLowerInvariant().IndexOf("audio playing") >= 0;
         }
 
-        // The weaker signal: a mute button on the tab. In Firefox it appears only while a
-        // tab is audible; elsewhere it may linger after the sound stops.
-        // Reads only from the cache filled by the single bulk fetch: no round trips.
-        static bool HasAudioButton(AutomationElement tab)
+        // The weaker signal: a mute button on the tab. Reads only cached children.
+        static bool HasAudioButton(IUIAutomationElement tab)
         {
+            IUIAutomationElementArray children;
+            if (tab.GetCachedChildren(out children) != 0 || children == null) return false;
             try
             {
-                foreach (AutomationElement c in tab.CachedChildren)
+                int n;
+                children.get_Length(out n);
+                for (int i = 0; i < n; i++)
                 {
-                    string n = c.Cached.Name;
-                    if (n == null) continue;
-                    n = n.ToLowerInvariant();
-                    foreach (string label in MuteLabels)
-                        if (n == label) return true;
-                    if (n.IndexOf("audio playing") >= 0) return true;
+                    IUIAutomationElement c;
+                    if (children.GetElement(i, out c) != 0 || c == null) continue;
+                    try
+                    {
+                        string s = CachedString(c, UIA_NamePropertyId);
+                        if (s == null) continue;
+                        s = s.ToLowerInvariant();
+                        foreach (string label in MuteLabels)
+                            if (s == label) return true;
+                        if (s.IndexOf("audio playing") >= 0) return true;
+                    }
+                    finally { Release(c); }
                 }
             }
-            catch { }
+            finally { Release(children); }
             return false;
         }
 
-        // The tab strip sits near the top of the chrome tree; a bounded walk keeps us out
-        // of the page content, whose accessibility tree can be enormous.
         const int MaxStripDepth = 12;
         const int MaxStripNodes = 400;
 
         // Breadth-first, because depth varies by application: a browser keeps its tab
         // strip about four levels down in native chrome, while an Electron shell draws
-        // its tabs in HTML and buries them around nine. Searching by levels finds the
-        // shallow ones as fast as before without giving up on the deep ones, and the node
-        // budget is what keeps a window that has no tab strip cheap - the page content
-        // below is a tree we must never wander into.
-        static AutomationElement FindTabStrip(AutomationElement root, int unusedDepth)
+        // its tabs in HTML and buries them around nine. The node budget keeps a window
+        // with no tab strip cheap - the page content below is a tree we must never
+        // wander into. Every element visited and rejected is released before moving on.
+        static IUIAutomationElement FindTabStrip(IUIAutomation au, IntPtr hwnd)
         {
+            IUIAutomationElement root;
+            if (au.ElementFromHandle(hwnd, out root) != 0 || root == null) return null;
+
+            IUIAutomationCondition view;
+            au.get_ControlViewCondition(out view);
+
+            Queue<IUIAutomationElement> queue = new Queue<IUIAutomationElement>();
+            Queue<int> depths = new Queue<int>();
+            queue.Enqueue(root);
+            depths.Enqueue(0);
+            int visited = 0;
+            IUIAutomationElement result = null;
+
             try
             {
-                CacheRequest cr = new CacheRequest();
-                cr.Add(AutomationElement.ControlTypeProperty);
-                cr.TreeScope = TreeScope.Element;
-                cr.AutomationElementMode = AutomationElementMode.Full;
-
-                Queue<AutomationElement> queue = new Queue<AutomationElement>();
-                Queue<int> depths = new Queue<int>();
-                queue.Enqueue(root);
-                depths.Enqueue(0);
-                int visited = 0;
-
-                while (queue.Count > 0 && visited < MaxStripNodes)
+                while (queue.Count > 0 && visited < MaxStripNodes && result == null)
                 {
-                    AutomationElement node = queue.Dequeue();
+                    IUIAutomationElement node = queue.Dequeue();
                     int depth = depths.Dequeue();
-                    if (depth >= MaxStripDepth) continue;
-
-                    AutomationElementCollection children;
-                    using (cr.Activate())
-                        children = node.FindAll(TreeScope.Children, Condition.TrueCondition);
-
-                    foreach (AutomationElement c in children)
+                    try
                     {
-                        visited++;
-                        if (c.Cached.ControlType == ControlType.Tab) return c;
-                        queue.Enqueue(c);
-                        depths.Enqueue(depth + 1);
+                        if (depth >= MaxStripDepth) continue;
+
+                        IUIAutomationElementArray children;
+                        if (node.FindAllBuildCache(TreeScope_Children, view, childScan, out children) != 0 ||
+                            children == null) continue;
+                        try
+                        {
+                            int n;
+                            children.get_Length(out n);
+                            for (int i = 0; i < n; i++)
+                            {
+                                IUIAutomationElement c;
+                                if (children.GetElement(i, out c) != 0 || c == null) continue;
+                                visited++;
+                                if (result == null &&
+                                    CachedInt(c, UIA_ControlTypePropertyId) == UIA_TabControlTypeId)
+                                {
+                                    result = c;   // ownership moves to the caller
+                                    continue;
+                                }
+                                if (result == null && depth + 1 < MaxStripDepth)
+                                {
+                                    queue.Enqueue(c);
+                                    depths.Enqueue(depth + 1);
+                                }
+                                else Release(c);
+                            }
+                        }
+                        finally { Release(children); }
                     }
+                    finally { if (node != root) Release(node); }
                 }
             }
-            catch { }
-            return null;
+            finally
+            {
+                while (queue.Count > 0)
+                {
+                    IUIAutomationElement leftover = queue.Dequeue();
+                    if (leftover != root) Release(leftover);
+                }
+                Release(root);
+                Release(view);
+            }
+            return result;
         }
 
         public static bool Activate(Hit hit)
@@ -1113,15 +1399,17 @@ namespace SoundFocus
                 try
                 {
                     object pattern;
-                    if (hit.Tab.TryGetCurrentPattern(SelectionItemPattern.Pattern, out pattern))
+                    if (hit.Tab.GetCurrentPattern(UIA_SelectionItemPatternId, out pattern) == 0 &&
+                        pattern != null)
                     {
-                        ((SelectionItemPattern)pattern).Select();
-                        ok = true;
+                        try { ok = ((IUIAutomationSelectionItemPattern)pattern).Select() == 0; }
+                        finally { Release(pattern); }
                     }
-                    else if (hit.Tab.TryGetCurrentPattern(InvokePattern.Pattern, out pattern))
+                    if (!ok && hit.Tab.GetCurrentPattern(UIA_InvokePatternId, out pattern) == 0 &&
+                        pattern != null)
                     {
-                        ((InvokePattern)pattern).Invoke();
-                        ok = true;
+                        try { ok = ((IUIAutomationInvokePattern)pattern).Invoke() == 0; }
+                        finally { Release(pattern); }
                     }
                 }
                 catch { }
@@ -1237,7 +1525,7 @@ namespace SoundFocus
         {
             string hotkey = "alt+shift+d";
             string returnHotkey = "alt+shift+f";
-            bool listOnly = false, debug = false, testTab = false, showMenu = false;
+            bool listOnly = false, debug = false, testTab = false, showMenu = false, stress = false;
             for (int i = 0; i < argv.Length; i++)
             {
                 if (argv[i] == "--hotkey" && i + 1 < argv.Length) hotkey = argv[++i];
@@ -1258,6 +1546,7 @@ namespace SoundFocus
                 else if (argv[i] == "--list") listOnly = true;
                 else if (argv[i] == "--debug") debug = true;
                 else if (argv[i] == "--no-tab") useTabs = false;
+                else if (argv[i] == "--stress") stress = true;
                 else if (argv[i] == "--test-tab") testTab = true;
                 else if (argv[i] == "--menu") showMenu = true;
                 else if (argv[i] == "--log")
@@ -1338,6 +1627,7 @@ namespace SoundFocus
                     if (hit == null) { Console.Write(n.Name + ": no tab found\r\n"); continue; }
                     bool ok = TabHunter.Activate(hit);
                     Console.Write(n.Name + ": activate [" + hit.Title + "] -> " + ok + "\r\n");
+                    hit.Dispose();
                 }
                 return 0;
             }
@@ -1370,6 +1660,7 @@ namespace SoundFocus
                     TabHunter.Hit hit = TabHunter.Find(cands, Smtc.TitleFor(n.Name), 3000);
                     sb.Append("    tab: " + (hit == null ? "<none found>"
                               : "[" + hit.Title + "] in window [" + Win.TitleOf(hit.Window) + "]") + "\r\n");
+                    if (hit != null) hit.Dispose();
                 }
                 // GUI subsystem app: borrow the launching console so --list is scriptable
                 if (AttachConsole(-1)) Console.Write(sb.ToString());
@@ -1423,6 +1714,16 @@ namespace SoundFocus
                 if (id == 1) OnHotkey(null, null);
                 else if (id == 2) OnReturn();
             };
+
+            if (stress)
+            {
+                // Runs every loop far faster than it ever would in use, so an hour of
+                // drift shows up in a minute. Only for hunting leaks.
+                watcher.PollMs = 20;
+                watcher.RescanMs = 100;
+                prewarmMs = 100;
+                Log.Write("STRESS MODE: poll=20ms rescan=100ms prewarm=100ms");
+            }
 
             watcher.Start();
             StartPrewarm();
@@ -1503,7 +1804,7 @@ namespace SoundFocus
         static List<Target> targetCache = new List<Target>();
         static long targetStamp;
         const int TargetTtlMs = 2000;
-        const int PrewarmMs = 1500;
+        static int prewarmMs = 1500;
 
         // Keeps the target list warm while anything is audible, so the cost is paid in the
         // background instead of in the 200 ms after a right-click. Idle when silent.
@@ -1518,7 +1819,7 @@ namespace SoundFocus
                     // most one interval old, including the moment audio starts.
                     try { RefreshTargets(); }
                     catch { }
-                    Thread.Sleep(PrewarmMs);
+                    Thread.Sleep(prewarmMs);
                 }
             });
             t.IsBackground = true;
@@ -1542,11 +1843,19 @@ namespace SoundFocus
         static List<Target> RefreshTargets()
         {
             List<Target> fresh = ResolveTargetsUncached();
+            List<Target> old;
             lock (targetGate)
             {
+                old = targetCache;
                 targetCache = fresh;
                 targetStamp = Environment.TickCount;
             }
+            // The replaced hits own UIA elements; free them now rather than whenever a
+            // collection happens. An open menu may still reference one - activating a
+            // released element fails cleanly and GoTo falls back to window focus.
+            if (old != null)
+                foreach (Target t in old)
+                    if (t.Tab != null) t.Tab.Dispose();
             return fresh;
         }
 

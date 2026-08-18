@@ -34,9 +34,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <!-- UI Automation: how the playing browser *tab* is found and selected -->
-    <Reference Include="UIAutomationClient" />
-    <Reference Include="UIAutomationTypes" />
   </ItemGroup>
 
   <ItemGroup>
