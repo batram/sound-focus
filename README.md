@@ -3,8 +3,9 @@
 Global hotkey that jumps to the window of whatever app is currently making sound.
 Press it again to cycle through the others if more than one is noisy.
 
-Windows has no built-in equivalent — the volume mixer shows you *which* app is playing,
-but there is no shortcut that focuses it.
+<p align="center">
+  <img align="center" width="576" height="200" alt="image" src="https://github.com/user-attachments/assets/3112eda0-a85e-4335-a95f-76568e9d2771" />
+</p>
 
 ## Build
 
