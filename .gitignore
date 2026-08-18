@@ -1,3 +1,5 @@
-# build output - rebuild with build.ps1
-SoundFocus.exe
+# build output
+bin/
+obj/
+*.exe
 *.pdb

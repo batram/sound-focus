@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <!--
+      net48 on purpose: .NET Framework 4.8 ships in-box with Windows 10 and 11, so the
+      built exe runs anywhere without installing a runtime, and the WinRT projection this
+      app reaches by reflection (media transport / now-playing titles) is present.
+    -->
+    <TargetFramework>net48</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <AssemblyName>SoundFocus</AssemblyName>
+    <RootNamespace>SoundFocus</RootNamespace>
+    <ApplicationIcon>SoundFocus.ico</ApplicationIcon>
+    <!-- AnyCPU would run 32-bit thanks to Prefer32Bit; match the host instead -->
+    <Prefer32Bit>false</Prefer32Bit>
+    <LangVersion>5</LangVersion>
+    <Deterministic>true</Deterministic>
+    <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
+    <Product>SoundFocus</Product>
+    <AssemblyTitle>SoundFocus</AssemblyTitle>
+    <Description>Jump to the window or browser tab currently making sound</Description>
+    <Version>1.0.0</Version>
+    <Copyright>SoundFocus contributors</Copyright>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Lets `dotnet build` target .NET Framework without Visual Studio or a targeting
+         pack installed: the reference assemblies come from this package. -->
+    <PackageReference Include="Microsoft.NETFramework.ReferenceAssemblies" Version="1.0.3">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- UI Automation: how the playing browser *tab* is found and selected -->
+    <Reference Include="UIAutomationClient" />
+    <Reference Include="UIAutomationTypes" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- The tray loads this at runtime and picks the true 16px frame, rather than the
+         single downscaled size ExtractAssociatedIcon would hand back. -->
+    <EmbeddedResource Include="SoundFocus.ico" LogicalName="SoundFocus.ico" />
+  </ItemGroup>
+
+  <Target Name="GenerateIcon" BeforeTargets="BeforeBuild"
+          Condition="!Exists('$(MSBuildProjectDirectory)\SoundFocus.ico')">
+    <Message Importance="high" Text="SoundFocus.ico missing, drawing it with make-icon.ps1" />
+    <Exec Command="powershell -NoProfile -ExecutionPolicy Bypass -File &quot;$(MSBuildProjectDirectory)\make-icon.ps1&quot;" />
+  </Target>
+
+</Project>

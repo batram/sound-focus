@@ -10,15 +10,24 @@ Press it again to cycle through the others if more than one is noisy.
 ## Build
 
 ```powershell
-powershell -NoProfile -File build.ps1
+dotnet build -c Release
 ```
 
-Uses the .NET Framework compiler already on the machine
-(`C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe`). No dependencies, single ~20 KB exe.
+Output: `bin\Release\net48\SoundFocus.exe` — a single ~130 KB exe, no files to ship
+alongside it.
+
+Requires only the .NET SDK; no Visual Studio, no Windows SDK, no targeting pack. It
+targets **net48** on purpose: .NET Framework 4.8 ships in-box with Windows 10 and 11, so
+the result runs anywhere without installing a runtime, and the WinRT projection this app
+reaches by reflection is present there. `Microsoft.NETFramework.ReferenceAssemblies`
+supplies the reference assemblies, so nothing outside the repo needs to exist on the
+machine. If `SoundFocus.ico` is missing, the build draws it first via `make-icon.ps1`.
 
 ## Run
 
 ```powershell
+cd bin\Release\net48
+
 .\SoundFocus.exe                       # tray app, default hotkey Alt+Shift+D
 .\SoundFocus.exe --hotkey ctrl+alt+f9  # any ctrl/alt/shift/win + letter or F-key
 .\SoundFocus.exe --list                # print what is making sound right now, then exit

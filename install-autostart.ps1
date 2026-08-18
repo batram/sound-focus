@@ -11,7 +11,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$exe = Join-Path $root 'SoundFocus.exe'
+$exe = Join-Path $root 'bin\Release\net48\SoundFocus.exe'
 $startup = [Environment]::GetFolderPath('Startup')
 $link = Join-Path $startup 'SoundFocus.lnk'
 
@@ -22,9 +22,15 @@ if ($Remove) {
 }
 
 if (-not (Test-Path $exe)) {
-    Write-Output "SoundFocus.exe not found, building it first"
-    & (Join-Path $root 'build.ps1')
+    Write-Output "SoundFocus.exe not built yet, running dotnet build"
+    Push-Location $root
+    try {
+        dotnet build -c Release
+        if ($LASTEXITCODE -ne 0) { throw "dotnet build failed ($LASTEXITCODE)" }
+    }
+    finally { Pop-Location }
 }
+if (-not (Test-Path $exe)) { throw "expected the build to produce $exe" }
 
 $shell = New-Object -ComObject WScript.Shell
 $sc = $shell.CreateShortcut($link)

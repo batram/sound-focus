@@ -848,8 +848,30 @@ namespace SoundFocus
             Hit h = new Hit();
             h.Window = hwnd;
             h.Tab = tab;
-            h.Title = title;
+            h.Title = CleanTitle(title);
             return h;
+        }
+
+        // Chromium appends its own status to the accessible name, e.g.
+        //   "Some Video - YouTube - Audio playing - Memory usage - 392 MB"
+        // Useful as a signal, noise in a menu. Only trailing known markers are dropped,
+        // so a real title containing similar words survives.
+        static readonly string[] Suffixes = { "audio playing", "audio muting", "memory usage" };
+
+        static string CleanTitle(string title)
+        {
+            if (string.IsNullOrEmpty(title)) return title;
+            string[] parts = title.Split(new string[] { " - " }, StringSplitOptions.None);
+            int keep = parts.Length;
+            for (int i = parts.Length - 1; i > 0; i--)
+            {
+                string p = parts[i].Trim().ToLowerInvariant();
+                bool drop = p.EndsWith(" mb") || p.EndsWith(" kb") || p.EndsWith(" gb");
+                foreach (string s in Suffixes) if (p == s) drop = true;
+                if (!drop) break;
+                keep = i;
+            }
+            return keep == parts.Length ? title : string.Join(" - ", parts, 0, keep);
         }
 
         static bool IsAudible(AutomationElement tab, TreeWalker walker)
