@@ -36,6 +36,9 @@ cd bin\Release\net48
 .\SoundFocus.exe --menu                # print what the tray menu would list
 .\SoundFocus.exe --debug               # raw per-session dump (devices / state / peak / pid)
 
+.\SoundFocus.exe --log                 # trace tray clicks and menu behaviour to %TEMP%\soundfocus.log
+.\SoundFocus.exe --log C:\path\to.log  # ...or somewhere of your choosing
+
 .\SoundFocus.exe --test-tab            # select the playing tab without raising its window
 .\SoundFocus.exe --no-tab              # skip UI Automation, windows only
 .\SoundFocus.exe --mute-label "Tab stummschalten"   # non-English Firefox
@@ -81,11 +84,18 @@ format code that way, pick something else with `--return-hotkey`.
 Left-click jumps, exactly like the hotkey. Right-click opens a menu that is **rebuilt every
 time it opens** — the list is only true at the moment it is shown.
 
-The menu is shown by hand rather than through `NotifyIcon.ContextMenuStrip`, taking the
-foreground first: left to itself, the first right-click merely activates the app and shows
-nothing, and only the second one opens the menu. A dummy message posted afterwards is the
-documented companion to that, without which the menu can refuse to close when you click
-away from it.
+Two Win32 details keep the tray menu honest, both found by tracing real clicks with `--log`:
+
+- **The menu is built and its window handle forced into existence at startup.** A
+  `ToolStripDropDown` that is still empty and handle-less when `Show` is first called
+  swallows that first call: the `Opening` handler runs and fills the menu, but the display
+  attempt is already lost — so the first right-click did nothing and only the second
+  worked. Notably it is *not* the usual foreground-activation story: the trace showed the
+  app foreground, `SetForegroundWindow` succeeding and `Opening` firing, with `Opened`
+  never following.
+- **It is shown by hand after taking the foreground**, not via
+  `NotifyIcon.ContextMenuStrip`, with a dummy message posted afterwards. That is what makes
+  the menu close when you click away from it.
 
 ```
 Playing now

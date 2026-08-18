@@ -482,7 +482,7 @@ namespace SoundFocus
         [DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
         [DllImport("user32.dll")] public static extern bool PostMessage(IntPtr h, uint msg, IntPtr w, IntPtr l);
 
-        public static void Raise(IntPtr h) { SetForegroundWindow(h); }
+        public static bool Raise(IntPtr h) { return SetForegroundWindow(h); }
         [DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
         [DllImport("user32.dll")] static extern bool ShowWindow(IntPtr h, int cmd);
         [DllImport("user32.dll")] static extern bool IsIconic(IntPtr h);
@@ -1103,6 +1103,35 @@ namespace SoundFocus
 
     #endregion
 
+    // Opt-in tracing to a file, for the things that can only be seen on a real desktop
+    // with a real mouse: what the tray reports, and what the menu does afterwards.
+    static class Log
+    {
+        static string path;
+        static readonly object gate = new object();
+
+        public static bool Enabled { get { return path != null; } }
+
+        public static void Open(string file)
+        {
+            path = file;
+            lock (gate)
+                try { File.AppendAllText(path, "\r\n=== SoundFocus started " + DateTime.Now + "\r\n"); }
+                catch { path = null; }
+        }
+
+        public static void Write(string line)
+        {
+            if (path == null) return;
+            lock (gate)
+                try
+                {
+                    File.AppendAllText(path, DateTime.Now.ToString("HH:mm:ss.fff") + "  " + line + "\r\n");
+                }
+                catch { }
+        }
+    }
+
     class HotkeyWindow : NativeWindow, IDisposable
     {
         // id of the hotkey that fired: 1 = jump to sound, 2 = go back
@@ -1198,6 +1227,13 @@ namespace SoundFocus
                 else if (argv[i] == "--no-tab") useTabs = false;
                 else if (argv[i] == "--test-tab") testTab = true;
                 else if (argv[i] == "--menu") showMenu = true;
+                else if (argv[i] == "--log")
+                {
+                    string file = (i + 1 < argv.Length && !argv[i + 1].StartsWith("--"))
+                        ? argv[++i]
+                        : Path.Combine(Path.GetTempPath(), "soundfocus.log");
+                    Log.Open(file);
+                }
                 else if (argv[i] == "--mute-label" && i + 1 < argv.Length)
                     TabHunter.MuteLabels = new string[] { argv[++i].ToLowerInvariant() };
                 else if (argv[i] == "--help" || argv[i] == "-h")
@@ -1360,19 +1396,48 @@ namespace SoundFocus
 
             hotkeySpec = hotkey;
             returnSpec = returnHotkey;
+
+
             menu = new ContextMenuStrip();
             menu.Opening += BuildMenu;
+
+            // Build the items and force the window handle into existence now. A dropdown
+            // that is still empty and handle-less when Show is first called swallows that
+            // first Show: the Opening handler runs and fills it, but the display attempt
+            // is already lost, which is why only the second click ever worked.
+            BuildMenu(null, null);
+            IntPtr menuHandle = menu.Handle;
+            Log.Write("menu prepared: handle=" + menuHandle + " items=" + menu.Items.Count);
 
             tray = new NotifyIcon();
             tray.Icon = AppIcon();
             tray.Text = Trim("SoundFocus - " + hotkey);
             // Deliberately not tray.ContextMenuStrip: see ShowTrayMenu
+            tray.MouseDown += delegate(object s, MouseEventArgs me)
+            {
+                Log.Write("tray MouseDown " + me.Button + " clicks=" + me.Clicks);
+            };
             tray.MouseUp += delegate(object s, MouseEventArgs me)
             {
+                Log.Write("tray MouseUp " + me.Button + " fg=" + Win.GetForegroundWindow());
                 if (me.Button == MouseButtons.Left) OnHotkey(null, null);
                 else if (me.Button == MouseButtons.Right) ShowTrayMenu();
             };
+            tray.Click += delegate(object s, EventArgs ev) { Log.Write("tray Click"); };
+
+            menu.Opened += delegate { Log.Write("menu Opened, visible=" + menu.Visible); };
+            menu.Closing += delegate(object s, ToolStripDropDownClosingEventArgs ce)
+            {
+                Log.Write("menu Closing, reason=" + ce.CloseReason);
+            };
+            menu.Closed += delegate(object s, ToolStripDropDownClosedEventArgs ce)
+            {
+                Log.Write("menu Closed, reason=" + ce.CloseReason);
+            };
+
             tray.Visible = true;
+            Log.Write("tray visible, owner window=" + hk.Handle + ", hotkey=" + hotkey +
+                      ", return=" + returnHotkey);
 
             Application.Run();
 
@@ -1605,6 +1670,7 @@ namespace SoundFocus
 
         static HotkeyWindow hkWindow;
 
+
         // A tray menu misbehaves unless its owner is the foreground window: letting
         // NotifyIcon show the menu itself means the first right-click only activates us
         // and no menu appears, and the second one works. Showing it by hand after taking
@@ -1614,9 +1680,28 @@ namespace SoundFocus
         // it the menu can refuse to close when you click away from it.
         static void ShowTrayMenu()
         {
-            if (hkWindow != null) Win.Raise(hkWindow.Handle);
-            menu.Show(Cursor.Position);
-            if (hkWindow != null) Win.PostMessage(hkWindow.Handle, 0x0000 /*WM_NULL*/, IntPtr.Zero, IntPtr.Zero);
+            try
+            {
+                IntPtr before = Win.GetForegroundWindow();
+                // Both halves matter: Activate makes WinForms consider the app active, so
+                // the dropdown will open at all, and SetForegroundWindow makes Windows
+                // agree, so the menu closes properly when clicking away.
+                bool raised = false;
+                if (hkWindow != null) raised = Win.Raise(hkWindow.Handle);
+                Log.Write("ShowTrayMenu: owner=" + (hkWindow == null ? "null" : hkWindow.Handle.ToString()) +
+                          " fgBefore=" + before + " SetForegroundWindow=" + raised +
+                          " fgAfter=" + Win.GetForegroundWindow() +
+                          " activeForm=" + (Form.ActiveForm == null ? "none" : "yes") +
+                          " menuHandleCreated=" + menu.IsHandleCreated +
+                          " itemsBefore=" + menu.Items.Count);
+
+                menu.Show(Cursor.Position);
+                Log.Write("ShowTrayMenu: after Show, visible=" + menu.Visible +
+                          " items=" + menu.Items.Count);
+
+                if (hkWindow != null) Win.PostMessage(hkWindow.Handle, 0x0000 /*WM_NULL*/, IntPtr.Zero, IntPtr.Zero);
+            }
+            catch (Exception ex) { Log.Write("ShowTrayMenu THREW: " + ex); }
         }
 
         // Rebuilt on every open: the list is only true at the moment it is shown.
