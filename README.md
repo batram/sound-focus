@@ -38,7 +38,16 @@ Jumping to the playing **tab** is on by default — no extension needed. `--send
 may be repeated for different apps. A `--send` chord equal to the global hotkey is refused:
 it would be swallowed by our own hotkey and retrigger SoundFocus instead of reaching the app.
 
-To autostart, drop a shortcut in `shell:startup`.
+## Autostart
+
+```powershell
+powershell -NoProfile -File install-autostart.ps1
+powershell -NoProfile -File install-autostart.ps1 -Arguments '--hotkey ctrl+alt+f9'
+powershell -NoProfile -File install-autostart.ps1 -Remove
+```
+
+Writes a shortcut into the per-user Startup folder — no admin rights, nothing in the
+registry, removable with `-Remove`. It builds the exe first if it is missing.
 
 ## Tray
 
