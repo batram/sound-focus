@@ -1321,8 +1321,32 @@ namespace SoundFocus
         // its tabs in HTML and buries them around nine. The node budget keeps a window
         // with no tab strip cheap - the page content below is a tree we must never
         // wander into. Every element visited and rejected is released before moving on.
+        // A window that answers with only a handful of nodes has most likely just been
+        // asked for its accessibility tree for the first time: Chromium, and so every
+        // Electron app, builds it on demand, and the first request sees the bare
+        // window while the renderer is still serializing. Measured against an Electron
+        // shell: 14 nodes on the first touch, the whole tab strip one second later.
+        // Remembering that first answer would hide the strip for a full cache TTL, so
+        // a sparse window gets a few short retries before it is believed.
+        const int SparseWindowNodes = 20;
+        const int SparseRetries = 5;
+        const int SparseRetryMs = 300;
+
         static IUIAutomationElement FindTabStrip(IUIAutomation au, IntPtr hwnd)
         {
+            for (int attempt = 0; ; attempt++)
+            {
+                int visited;
+                IUIAutomationElement strip = FindTabStripOnce(au, hwnd, out visited);
+                if (strip != null || visited > SparseWindowNodes || attempt >= SparseRetries)
+                    return strip;
+                Thread.Sleep(SparseRetryMs);
+            }
+        }
+
+        static IUIAutomationElement FindTabStripOnce(IUIAutomation au, IntPtr hwnd, out int visited)
+        {
+            visited = 0;
             IUIAutomationElement root;
             if (au.ElementFromHandle(hwnd, out root) != 0 || root == null) return null;
 
@@ -1333,7 +1357,6 @@ namespace SoundFocus
             Queue<int> depths = new Queue<int>();
             queue.Enqueue(root);
             depths.Enqueue(0);
-            int visited = 0;
             IUIAutomationElement result = null;
 
             try

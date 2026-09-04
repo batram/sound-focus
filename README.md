@@ -191,15 +191,22 @@ against an Electron app ([once](https://github.com/batram/once)) by doing exactl
 2. When a tab is audible, put **`- Audio playing`** in its accessible name, matching
    Chromium's wording: `aria-label="${title} - Audio playing"`. SoundFocus strips that
    suffix again before showing the title.
-3. **Electron only:** call `app.setAccessibilitySupportEnabled(true)`. Chromium builds no
-   accessibility tree until asked, and unlike Chrome, Electron does not switch it on when a
-   client comes knocking — not even for a `WM_GETOBJECT` poke. Without it the window
-   exposes about fifteen nodes and nothing of the UI inside.
+3. **Electron: nothing.** Do *not* call `app.setAccessibilitySupportEnabled(true)` for
+   this — that switches on the full screen-reader tree for every page, and on a
+   60,000-node page it costs seconds of the main process and a hundred megabytes per
+   tab. Chromium builds a basic tree by itself the moment a UI Automation client touches
+   the window, Electron included; it just arrives a beat later than the first answer.
+   That first answer is the bare window, about fifteen nodes, which is what an earlier
+   version of this README mistook for "Electron never switches it on". SoundFocus now
+   treats a window that answers with fewer than 20 nodes as still warming up and asks
+   again a few times, 300 ms apart; measured against an Electron shell the strip is
+   there within one second.
 
 The strip search is breadth-first to depth 12 with a 400-node budget, because depth varies
 by application: browsers keep their tab strip about four levels down in native chrome,
 while an Electron shell draws tabs in HTML and buries them around nine. Measured worst case
-for a window with no tab strip at all is ~100 ms, once, then cached.
+for a window with no tab strip at all is ~100 ms, once, then cached — plus up to 1.5 s of
+retries for a window that answers sparsely, which only a cold Chromium window does.
 
 Safeguards, since this talks to another process:
 
