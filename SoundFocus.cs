@@ -1777,6 +1777,8 @@ namespace SoundFocus
         // Rebuilt on every open: the list is only true at the moment it is shown.
         static void BuildMenu(object sender, CancelEventArgs e)
         {
+            // Clear alone does not dispose dropdowns or their pending event handlers.
+            while (menu.Items.Count > 0) menu.Items[0].Dispose();
             menu.Items.Clear();
 
             ToolStripMenuItem header = new ToolStripMenuItem("Playing now");
@@ -1841,6 +1843,11 @@ namespace SoundFocus
             }
 
             menu.Items.Add(new ToolStripSeparator());
+            ToolStripMenuItem otherSessions = new ToolStripMenuItem("Other audio sessions");
+            otherSessions.DropDownItems.Add(new ToolStripMenuItem("Loading…") { Enabled = false });
+            otherSessions.DropDownOpening += delegate { PopulateOtherAudioSessions(otherSessions); };
+            menu.Items.Add(otherSessions);
+            menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("Jump to sound (" + hotkeySpec + ")",
                 null, delegate { OnHotkey(null, null); }));
 
@@ -1856,6 +1863,73 @@ namespace SoundFocus
 
             menu.Items.Add(new ToolStripSeparator());
             menu.Items.Add(new ToolStripMenuItem("Exit", null, delegate { Application.Exit(); }));
+        }
+
+        static async void PopulateOtherAudioSessions(ToolStripMenuItem parent)
+        {
+            // Cache for this main-menu opening, including lazy window resolution.
+            if (parent.Tag != null) return;
+            parent.Tag = true;
+            try
+            {
+                Task<List<OtherAudioSession>> snapshot = watcher.OtherSessionsAsync();
+                if (await Task.WhenAny(snapshot, Task.Delay(2000)) != snapshot)
+                    throw new TimeoutException("Audio session snapshot timed out");
+                List<OtherAudioSession> sessions = await snapshot;
+                if (parent.IsDisposed) return;
+                var grouped = new Dictionary<string, OtherAudioSession>();
+                var windows = new Dictionary<string, IntPtr>();
+                List<Noisy> audible = watcher.Current();
+                foreach (OtherAudioSession session in sessions)
+                {
+                    IntPtr window = IntPtr.Zero;
+                    foreach (ProcessIdentity candidate in session.Chain)
+                    {
+                        if (!candidate.IsRunning()) continue;
+                        List<IntPtr> found = Win.WindowsForPid(candidate.Pid);
+                        if (found.Count == 0) continue;
+                        session.Pid = candidate.Pid; session.Started = candidate.Started;
+                        session.Name = candidate.Name; window = found[0]; break;
+                    }
+                    if (audible.Exists(delegate(Noisy n) { return n.Pid == session.Pid && n.Started == session.Started; })) continue;
+                    string key = session.Pid + ":" + session.Started.Ticks;
+                    OtherAudioSession previous;
+                    if (!grouped.TryGetValue(key, out previous) || session.Active &&
+                        (!previous.Active || session.QuietSeconds < previous.QuietSeconds)) grouped[key] = session;
+                    windows[key] = window;
+                }
+                while (parent.DropDownItems.Count > 0) parent.DropDownItems[0].Dispose();
+                var ordered = new List<string>(grouped.Keys);
+                ordered.Sort(delegate(string a, string b) { return string.Compare(grouped[a].Name, grouped[b].Name, StringComparison.OrdinalIgnoreCase); });
+                foreach (string key in ordered)
+                {
+                    OtherAudioSession captured = grouped[key];
+                    string state = captured.Active ? "Active, quiet for " + captured.QuietSeconds + " s" : "Inactive";
+                    ToolStripMenuItem item = new ToolStripMenuItem(captured.Name + " — " + state, null, delegate
+                    {
+                        if (!ProcessIdentity.IsRunning(captured.Pid, captured.Started)) return;
+                        List<IntPtr> found = Win.WindowsForPid(captured.Pid);
+                        if (found.Count > 0) GoTo(new Target { Window = found[0], Owner = new Noisy {
+                            Pid = captured.Pid, Started = captured.Started, Name = captured.Name } }, false);
+                    });
+                    item.Enabled = !captured.System && windows[key] != IntPtr.Zero;
+                    item.ToolTipText = captured.System ? "Windows system sounds; no individual app can be identified" :
+                        (captured.Active ? "Stream is running, but no non-silent samples were recently detected." :
+                        "Audio session exists, but none of its streams are running.") +
+                        (item.Enabled ? " Click to focus the app." : " No available app window.");
+                    parent.DropDownItems.Add(item);
+                }
+                if (ordered.Count == 0) parent.DropDownItems.Add(new ToolStripMenuItem("(none)") { Enabled = false });
+            }
+            catch (Exception ex)
+            {
+                Log.Write("Other audio sessions: " + ex.Message);
+                if (!parent.IsDisposed)
+                {
+                    while (parent.DropDownItems.Count > 0) parent.DropDownItems[0].Dispose();
+                    parent.DropDownItems.Add(new ToolStripMenuItem("(sessions unavailable)") { Enabled = false });
+                }
+            }
         }
 
         static bool ParseHotkey(string spec, out int mods, out int vk)

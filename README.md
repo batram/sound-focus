@@ -143,6 +143,15 @@ linked into the exe twice: as a Win32 resource so Explorer shows it, and as an e
 resource the tray loads, so the tray gets the real 16px frame instead of a downscaled 32px
 one. The build regenerates it if the file is missing.
 
+The **Other audio sessions** submenu lists currently quiet sources, grouped by app.
+**Inactive** means the session has no running streams. **Active, quiet for N s** means
+a stream is running but no non-silent samples have been detected for at least three
+seconds (recently audible sessions first leave the five-second Playing now grace period).
+Click an enabled entry to focus its app; system sounds and sources without a window are
+informational. These entries do not add anything to audible history. The submenu loads
+on demand from the existing watcher registry, with no additional audio polling, and
+caches its entries until the main menu is reopened.
+
 ## How it works
 
 - Enumerates **every active render endpoint** once, subscribes to new-session and
@@ -361,6 +370,11 @@ and disposal. It measures watcher-process CPU, handles, private bytes and genera
 collections. The 20/50 ms results are characterization, not a guarantee; 100/571 ms and
 the delayed 100 ms cases are required to pass. Other apps playing during the run can
 affect history capacity and resource measurements.
+
+Use `-Trace submenu` to run the focused submenu test instead: a real silent stream must
+remain hidden during its three-second grace period, then appear under its owning app
+without entering audible history. It also checks lazy loading, menu disposal/reopening,
+and removal after the stream exits. This test does not play tones.
 
 Reports go to `artifacts/<variant>-probe.txt`. `-Trace trace` enables detailed event/peak
 logging for diagnosis; leave it off for resource measurements. `--debug` now reports the

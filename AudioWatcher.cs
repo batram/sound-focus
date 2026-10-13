@@ -45,6 +45,16 @@ namespace SoundFocus
         public static long Now { get { return Stopwatch.GetTimestamp() * 1000 / Stopwatch.Frequency; } }
     }
 
+    sealed class OtherAudioSession
+    {
+        public int Pid;
+        public string Name;
+        public DateTime Started;
+        public bool System, Active;
+        public long QuietSeconds;
+        public List<ProcessIdentity> Chain;
+    }
+
     // One MTA owns every audio RCW, registration and release. Callbacks only enqueue;
     // process/window metadata has a separate worker and never delays meter readings.
     class AudioWatcher : IDisposable
@@ -73,7 +83,7 @@ namespace SoundFocus
             public IntPtr SinkPointer;
             public int Pid, State;
             public bool System, Shared, Removed, MetadataQueued;
-            public long BurstUntil, NextSample, LastHeard, ObservedTicks;
+            public long BurstUntil, NextSample, LastHeard, ObservedTicks, ActiveSince;
             public int TraceSamples;
             public List<ProcessIdentity> Chain;
             public Observation Owner;
@@ -368,7 +378,7 @@ namespace SoundFocus
                 if (!system && pid <= 0) return;
                 session = new Session { Key = key, Endpoint = endpoint, Control = control,
                     Meter = control as IAudioMeterInformation, Pid = system ? 0 : pid, System = system,
-                    Shared = hr != 0, State = state, BurstUntil = AudioClock.Now + BurstMs };
+                    Shared = hr != 0, State = state, BurstUntil = AudioClock.Now + BurstMs, ActiveSince = AudioClock.Now };
                 session.Sink = new StateSink(this, session);
                 IntPtr pointer = Marshal.GetComInterfaceForObject(session.Sink, typeof(IAudioSessionEvents));
                 hr = control.RegisterAudioSessionNotification(pointer);
@@ -425,7 +435,7 @@ namespace SoundFocus
                 }
                 session.State = state;
                 session.NextSample = 0;
-                if (state == 1) session.BurstUntil = at + BurstMs;
+                if (state == 1) { session.BurstUntil = at + BurstMs; session.ActiveSince = at; }
             }
         }
 
@@ -633,6 +643,37 @@ namespace SoundFocus
                     result.Add(new SoundHistoryEntry { Pid = item.Pid, Name = item.Name, Started = item.Started,
                         Observed = item.Observed, Title = item.Title, TabTitle = item.TabTitle });
             return result;
+        }
+
+        // On-demand snapshot on the owning MTA: no extra meter reads or periodic timer.
+        public System.Threading.Tasks.Task<List<OtherAudioSession>> OtherSessionsAsync()
+        {
+            var completion = new System.Threading.Tasks.TaskCompletionSource<List<OtherAudioSession>>();
+            if (stopping) { completion.SetResult(new List<OtherAudioSession>()); return completion.Task; }
+            commands.Enqueue(delegate
+            {
+                try
+                {
+                    var result = new List<OtherAudioSession>();
+                    long now = AudioClock.Now;
+                    foreach (Session session in sessions.Values)
+                    {
+                        if (session.LastHeard != 0 && now - session.LastHeard <= MemoryMs) continue;
+                        long quiet = now - Math.Max(session.LastHeard, session.ActiveSince);
+                        if (session.State == 1 && quiet < 3000) continue;
+                        ProcessIdentity source = session.Chain.Count == 0 ? null : session.Chain[0];
+                        result.Add(new OtherAudioSession { Pid = session.Pid, System = session.System,
+                            Name = session.System ? "System sounds" : source == null ? "pid " + session.Pid : source.Name,
+                            Started = source == null ? DateTime.MinValue : source.Started,
+                            Active = session.State == 1, QuietSeconds = Math.Max(0, quiet / 1000),
+                            Chain = new List<ProcessIdentity>(session.Chain) });
+                    }
+                    completion.SetResult(result);
+                }
+                catch (Exception ex) { completion.SetException(ex); }
+            });
+            wake.Set();
+            return completion.Task;
         }
 
         public void RememberTab(int pid, string title)

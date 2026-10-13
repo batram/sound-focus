@@ -161,6 +161,7 @@ class AudioProbe
                 if (argv.Length > 2 && argv[2] == "trace")
                     assembly.GetType("SoundFocus.Log").GetMethod("Open").Invoke(null, new object[] { argv[1] + ".trace" });
                 object watcher = Activator.CreateInstance(assembly.GetType("SoundFocus.AudioWatcher"), true);
+                if (argv.Length > 2 && argv[2] == "submenu") return SubmenuProbe.Run(assembly, watcher, log);
                 bool candidate = watcher is IDisposable;
                 using (Form owner = new Form { Text = "SoundFocus audio probe owner" })
                 {
