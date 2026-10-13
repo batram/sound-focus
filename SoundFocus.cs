@@ -133,6 +133,24 @@ namespace SoundFocus
 
     #endregion
 
+    class SoundHistoryEntry
+    {
+        public int Pid;
+        public string Name, Title;
+        public DateTime Started, Observed;
+
+        public bool IsRunning()
+        {
+            if (Started == DateTime.MinValue) return false;
+            try
+            {
+                using (Process process = Process.GetProcessById(Pid))
+                    return !process.HasExited && process.StartTime == Started;
+            }
+            catch { return false; }
+        }
+    }
+
     class Noisy
     {
         public int Pid;
@@ -150,6 +168,7 @@ namespace SoundFocus
 
         readonly object gate = new object();
         readonly Dictionary<int, Noisy> noisy = new Dictionary<int, Noisy>();
+        readonly List<SoundHistoryEntry> history = new List<SoundHistoryEntry>();
         readonly List<IAudioSessionControl> sessions = new List<IAudioSessionControl>();
 
         public float Threshold = 0.0002f;
@@ -264,6 +283,13 @@ namespace SoundFocus
         {
             int owner = ProcTree.OwningWindowProcess(pid);
             long now = Environment.TickCount;
+            DateTime observed = DateTime.Now;
+            DateTime started;
+            try
+            {
+                using (Process process = Process.GetProcessById(owner)) started = process.StartTime;
+            }
+            catch { started = DateTime.MinValue; }
             lock (gate)
             {
                 Noisy n;
@@ -280,7 +306,25 @@ namespace SoundFocus
                     n.FirstSeen = now;   // went quiet and came back: treat as fresh
                 }
                 n.LastAudible = now;
+                int index = history.FindIndex(delegate(SoundHistoryEntry h)
+                    { return h.Pid == owner && h.Started == started; });
+                SoundHistoryEntry previous = index >= 0 ? history[index] : null;
+                string title = previous == null ? "" : previous.Title;
+                if (previous == null || previous.Observed.Second != observed.Second)
+                {
+                    List<IntPtr> windows = Win.WindowsForPid(owner);
+                    if (windows.Count > 0) title = Win.TitleOf(windows[0]);
+                }
+                if (index >= 0) history.RemoveAt(index);
+                history.Insert(0, new SoundHistoryEntry { Pid = owner, Name = n.Name,
+                    Started = started, Observed = observed, Title = title });
+                if (history.Count > 5) history.RemoveAt(5);
             }
+        }
+
+        public List<SoundHistoryEntry> History()
+        {
+            lock (gate) return new List<SoundHistoryEntry>(history);
         }
 
         public string LastScanNote = "";
@@ -2109,6 +2153,42 @@ namespace SoundFocus
                 ToolStripMenuItem item = new ToolStripMenuItem(t.Label,
                     null, delegate(object s2, EventArgs e2) { GoTo(captured); });
                 if (t.Tab != null) item.ToolTipText = "Jump to this tab";
+                menu.Items.Add(item);
+            }
+
+            menu.Items.Add(new ToolStripSeparator());
+            menu.Items.Add(new ToolStripMenuItem("History (last observed)") { Enabled = false });
+            List<SoundHistoryEntry> history = watcher.History();
+            bool hasObservations = history.Count > 0;
+            // Filter only the menu snapshot; retain observations for when an app goes quiet.
+            history.RemoveAll(delegate(SoundHistoryEntry entry)
+            {
+                return targets.Exists(delegate(Target target) { return target.Owner.Pid == entry.Pid; })
+                    && entry.IsRunning();
+            });
+            if (history.Count == 0)
+                menu.Items.Add(new ToolStripMenuItem(hasObservations
+                    ? "(no earlier entries)" : "(nothing observed yet)") { Enabled = false });
+            foreach (SoundHistoryEntry entry in history)
+            {
+                SoundHistoryEntry captured = entry;
+                string title = entry.Title ?? "";
+                if (title.Length > 55) title = title.Substring(0, 54) + "…";
+                string label = entry.Observed.ToString("yyyy-MM-dd HH:mm:ss") + "  —  " + entry.Name;
+                if (title.Length > 0) label += "  —  " + title;
+                ToolStripMenuItem item = new ToolStripMenuItem(label, null, delegate
+                {
+                    // Recheck at click time, including process identity: Windows reuses PIDs.
+                    if (!captured.IsRunning()) return;
+                    foreach (Target target in TargetsNow())
+                        if (target.Owner.Pid == captured.Pid) { GoTo(target); return; }
+                    List<IntPtr> windows = Win.WindowsForPid(captured.Pid);
+                    if (windows.Count > 0)
+                        GoTo(new Target { Window = windows[0],
+                            Owner = new Noisy { Pid = captured.Pid, Name = captured.Name } });
+                });
+                item.Enabled = entry.IsRunning() && Win.WindowsForPid(entry.Pid).Count > 0;
+                item.ToolTipText = item.Enabled ? "Jump to this app" : "Process stopped or has no available window";
                 menu.Items.Add(item);
             }
 
