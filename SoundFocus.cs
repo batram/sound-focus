@@ -141,13 +141,7 @@ namespace SoundFocus
 
         public bool IsRunning()
         {
-            if (Started == DateTime.MinValue) return false;
-            try
-            {
-                using (Process process = Process.GetProcessById(Pid))
-                    return !process.HasExited && process.StartTime == Started;
-            }
-            catch { return false; }
+            return ProcessIdentity.IsRunning(Pid, Started);
         }
     }
 
@@ -155,407 +149,12 @@ namespace SoundFocus
     {
         public int Pid;
         public string Name;
+        public DateTime Started;
         public long FirstSeen;   // ordering key, so the cycle order stays stable
         public long LastAudible;
     }
 
-    // Background poller: walks the audio sessions of every active render endpoint and
-    // records which processes actually pushed non-silent samples recently.
-    class AudioWatcher
-    {
-        const int RENDER = 0, DEVICE_STATE_ACTIVE = 1, CLSCTX_ALL = 23;
-        const int SESSION_ACTIVE = 1, SESSION_EXPIRED = 2;
-
-        readonly object gate = new object();
-        readonly Dictionary<int, Noisy> noisy = new Dictionary<int, Noisy>();
-        readonly List<SoundHistoryEntry> history = new List<SoundHistoryEntry>();
-        readonly List<IAudioSessionControl> sessions = new List<IAudioSessionControl>();
-
-        public float Threshold = 0.0002f;
-        public int MemoryMs = 5000;      // how long an app stays "recently noisy"
-        public int PollMs = 150;
-        public int RescanMs = 2000;
-
-        long lastScan;
-        int ticks;
-
-        List<IAudioSessionManager2> managers;   // one per active render endpoint
-        long lastDeviceScan;
-        const int DeviceRescanMs = 15000;
-
-        public void Start()
-        {
-            Thread t = new Thread(Loop);
-            t.IsBackground = true;
-            t.SetApartmentState(ApartmentState.MTA);
-            t.Start();
-        }
-
-        void Loop()
-        {
-            while (true)
-            {
-                try { Tick(); }
-                catch { lastScan = 0; }
-                if (++ticks % 5 == 0) Smtc.Refresh();   // now-playing titles, ~every 750 ms
-                Thread.Sleep(PollMs);
-            }
-        }
-
-        public void Tick()
-        {
-            long now = Environment.TickCount;
-            if (lastScan == 0 || now - lastScan > RescanMs)
-            {
-                RescanSessions();
-                lastScan = now;
-            }
-
-            foreach (IAudioSessionControl s in sessions)
-            {
-                try
-                {
-                    int state;
-                    if (s.GetState(out state) != 0) continue;
-
-                    // An expired session means its endpoint went away underneath us -
-                    // headphones plugged in, default device switched - and the apps have
-                    // moved to an endpoint we are not watching. Re-enumerate immediately
-                    // rather than waiting out the endpoint interval.
-                    if (state == SESSION_EXPIRED) { managers = null; lastScan = 0; continue; }
-                    if (state != SESSION_ACTIVE) continue;
-
-                    IAudioMeterInformation meter = s as IAudioMeterInformation;
-                    if (meter == null) continue;
-                    float peak;
-                    if (meter.GetPeakValue(out peak) != 0 || peak < Threshold) continue;
-
-                    IAudioSessionControl2 c2 = s as IAudioSessionControl2;
-                    if (c2 == null) continue;
-                    if (c2.IsSystemSoundsSession() == 0) continue;  // S_OK means it IS system sounds
-                    int pid;
-                    if (c2.GetProcessId(out pid) != 0 || pid <= 0) continue;
-
-                    Remember(pid);
-                }
-                catch { lastScan = 0; }
-            }
-        }
-
-        // Diagnostic dump of every session on every active render endpoint.
-        public string Dump()
-        {
-            RescanSessions();
-            lastScan = Environment.TickCount;
-            StringBuilder sb = new StringBuilder();
-            sb.Append(LastScanNote + ", sessions: " + sessions.Count + "\r\n");
-            sb.Append(DumpDevices());
-            foreach (IAudioSessionControl s in sessions)
-            {
-                try
-                {
-                    int state = -1; s.GetState(out state);
-                    float peak = -1;
-                    IAudioMeterInformation m = s as IAudioMeterInformation;
-                    if (m != null) m.GetPeakValue(out peak);
-                    IAudioSessionControl2 c2 = s as IAudioSessionControl2;
-                    int pid = -1; int sys = -1;
-                    string disp = null, sid = null, iid2 = null;
-                    if (c2 != null)
-                    {
-                        c2.GetProcessId(out pid); sys = c2.IsSystemSoundsSession();
-                        c2.GetDisplayName(out disp);
-                        c2.GetSessionIdentifier(out sid);
-                        c2.GetSessionInstanceIdentifier(out iid2);
-                    }
-                    sb.Append("  state=" + state + " peak=" + peak.ToString("0.00000") +
-                              " pid=" + pid + " (" + ProcTree.NameOf(pid) + ")" +
-                              " sysSounds=" + sys + " meter=" + (m != null) +
-                              "\r\n      display=[" + disp + "]\r\n      sid=[" + sid +
-                              "]\r\n      inst=[" + iid2 + "]\r\n");
-                }
-                catch (Exception ex) { sb.Append("  <error " + ex.Message + ">\r\n"); }
-            }
-            return sb.ToString();
-        }
-
-        void Remember(int pid)
-        {
-            int owner = ProcTree.OwningWindowProcess(pid);
-            long now = Environment.TickCount;
-            DateTime observed = DateTime.Now;
-            DateTime started;
-            try
-            {
-                using (Process process = Process.GetProcessById(owner)) started = process.StartTime;
-            }
-            catch { started = DateTime.MinValue; }
-            lock (gate)
-            {
-                Noisy n;
-                if (!noisy.TryGetValue(owner, out n))
-                {
-                    n = new Noisy();
-                    n.Pid = owner;
-                    n.Name = ProcTree.NameOf(owner);
-                    n.FirstSeen = now;
-                    noisy[owner] = n;
-                }
-                else if (now - n.LastAudible > MemoryMs)
-                {
-                    n.FirstSeen = now;   // went quiet and came back: treat as fresh
-                }
-                n.LastAudible = now;
-                int index = history.FindIndex(delegate(SoundHistoryEntry h)
-                    { return h.Pid == owner && h.Started == started; });
-                SoundHistoryEntry previous = index >= 0 ? history[index] : null;
-                string title = previous == null ? "" : previous.Title;
-                if (previous == null || previous.Observed.Second != observed.Second)
-                {
-                    List<IntPtr> windows = Win.WindowsForPid(owner);
-                    if (windows.Count > 0) title = Win.TitleOf(windows[0]);
-                }
-                if (index >= 0) history.RemoveAt(index);
-                history.Insert(0, new SoundHistoryEntry { Pid = owner, Name = n.Name,
-                    Started = started, Observed = observed, Title = title,
-                    TabTitle = previous == null ? null : previous.TabTitle });
-                if (history.Count > 5) history.RemoveAt(5);
-            }
-        }
-
-        public List<SoundHistoryEntry> History()
-        {
-            lock (gate) return new List<SoundHistoryEntry>(history);
-        }
-
-        public void RememberTab(int pid, string title)
-        {
-            if (string.IsNullOrEmpty(title)) return;
-            lock (gate)
-            {
-                int index = history.FindIndex(delegate(SoundHistoryEntry h) { return h.Pid == pid && h.IsRunning(); });
-                if (index < 0) return;
-                SoundHistoryEntry entry = history[index];
-                // Replace rather than mutate: an open menu owns its observation snapshot.
-                history[index] = new SoundHistoryEntry { Pid = entry.Pid, Name = entry.Name,
-                    Started = entry.Started, Observed = entry.Observed, Title = entry.Title, TabTitle = title };
-            }
-        }
-
-        public string LastScanNote = "";
-        public int ActiveDevices = -1;   // -1 until the first scan
-
-        // Every render endpoint in any state (1=active 2=disabled 4=not present 8=unplugged)
-        public string DumpDevices()
-        {
-            StringBuilder sb = new StringBuilder();
-            try
-            {
-                IMMDeviceEnumerator de = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
-                IMMDeviceCollection all;
-                int hr = de.EnumAudioEndpoints(RENDER, 15, out all);
-                if (hr != 0) return "  endpoint enum failed hr=0x" + hr.ToString("X8") + "\r\n";
-                int n;
-                all.GetCount(out n);
-                sb.Append("  render endpoints (any state): " + n + "\r\n");
-                for (int i = 0; i < n; i++)
-                {
-                    IMMDevice d;
-                    if (all.Item(i, out d) != 0) continue;
-                    int st; string id;
-                    d.GetState(out st);
-                    d.GetId(out id);
-                    sb.Append("    state=" + st + "  " + id + "\r\n");
-                    ComRelease(d);
-                }
-                ComRelease(all);
-                ComRelease(de);
-            }
-            catch (Exception ex) { sb.Append("  <device dump error " + ex.Message + ">\r\n"); }
-            return sb.ToString();
-        }
-
-        // COM objects here are refetched on a schedule, so every replaced one is released
-        // on the spot. Relying on the GC instead lets native proxies pile up unseen: the
-        // managed wrappers are so small that collections almost never run.
-        static void ComRelease(object com)
-        {
-            if (com == null) return;
-            try { Marshal.FinalReleaseComObject(com); }
-            catch { }
-        }
-
-        void RescanSessions()
-        {
-            foreach (IAudioSessionControl old in sessions) ComRelease(old);
-            sessions.Clear();
-            ProcTree.Invalidate();
-
-            // Endpoints change when hardware is plugged or unplugged, which is rare, while
-            // sessions come and go whenever an app starts playing. Rebuilding the endpoint
-            // list and its session managers every couple of seconds was most of this
-            // program's idle cost, so only the session list is refreshed that often.
-            if (managers == null || Environment.TickCount - lastDeviceScan > DeviceRescanMs)
-                if (!RescanDevices()) return;
-
-            foreach (IAudioSessionManager2 mgr in managers)
-            {
-                try
-                {
-                    IAudioSessionEnumerator se;
-                    if (mgr.GetSessionEnumerator(out se) != 0) continue;
-                    try
-                    {
-                        int sc;
-                        se.GetCount(out sc);
-                        for (int j = 0; j < sc; j++)
-                        {
-                            IAudioSessionControl s;
-                            if (se.GetSession(j, out s) == 0 && s != null) sessions.Add(s);
-                        }
-                    }
-                    finally { ComRelease(se); }
-                }
-                catch { managers = null; }   // endpoint went away: re-enumerate next tick
-            }
-        }
-
-        bool RescanDevices()
-        {
-            if (managers != null)
-                foreach (IAudioSessionManager2 old in managers) ComRelease(old);
-            managers = new List<IAudioSessionManager2>();
-            lastDeviceScan = Environment.TickCount;
-
-            IMMDeviceEnumerator devEnum = (IMMDeviceEnumerator)new MMDeviceEnumeratorComObject();
-            IMMDeviceCollection devices = null;
-            try
-            {
-                int hr = devEnum.EnumAudioEndpoints(RENDER, DEVICE_STATE_ACTIVE, out devices);
-                if (hr != 0)
-                {
-                    LastScanNote = "EnumAudioEndpoints hr=0x" + hr.ToString("X8");
-                    managers = null;
-                    return false;
-                }
-                int count;
-                devices.GetCount(out count);
-                ActiveDevices = count;
-                LastScanNote = "active render devices: " + count;
-
-                Guid iid = typeof(IAudioSessionManager2).GUID;
-                for (int i = 0; i < count; i++)
-                {
-                    IMMDevice dev = null;
-                    try
-                    {
-                        if (devices.Item(i, out dev) != 0) continue;
-                        object o;
-                        if (dev.Activate(ref iid, CLSCTX_ALL, IntPtr.Zero, out o) != 0) continue;
-                        managers.Add((IAudioSessionManager2)o);
-                    }
-                    catch { }
-                    finally { ComRelease(dev); }
-                }
-                return true;
-            }
-            finally
-            {
-                ComRelease(devices);
-                ComRelease(devEnum);
-            }
-        }
-
-        // Processes audible within MemoryMs, oldest-first, so the cycle order is stable.
-        public List<Noisy> Current()
-        {
-            long now = Environment.TickCount;
-            List<Noisy> result = new List<Noisy>();
-            lock (gate)
-            {
-                List<int> dead = new List<int>();
-                foreach (KeyValuePair<int, Noisy> kv in noisy)
-                {
-                    if (now - kv.Value.LastAudible <= MemoryMs) result.Add(kv.Value);
-                    else if (now - kv.Value.LastAudible > 60000) dead.Add(kv.Key);
-                }
-                foreach (int d in dead) noisy.Remove(d);
-            }
-            result.Sort(delegate(Noisy a, Noisy b) { return a.FirstSeen.CompareTo(b.FirstSeen); });
-            return result;
-        }
-    }
-
     #region Process tree / window helpers
-
-    static class ProcTree
-    {
-        [StructLayout(LayoutKind.Sequential)]
-        struct PROCESSENTRY32
-        {
-            public int dwSize; public int cntUsage; public int th32ProcessID;
-            public IntPtr th32DefaultHeapID; public int th32ModuleID; public int cntThreads;
-            public int th32ParentProcessID; public int pcPriClassBase; public int dwFlags;
-            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)] public string szExeFile;
-        }
-
-        [DllImport("kernel32.dll")] static extern IntPtr CreateToolhelp32Snapshot(int flags, int pid);
-        [DllImport("kernel32.dll")] static extern bool Process32First(IntPtr snap, ref PROCESSENTRY32 e);
-        [DllImport("kernel32.dll")] static extern bool Process32Next(IntPtr snap, ref PROCESSENTRY32 e);
-        [DllImport("kernel32.dll")] static extern bool CloseHandle(IntPtr h);
-
-        static Dictionary<int, int> parent;
-        static Dictionary<int, string> names;
-
-        public static void Invalidate() { parent = null; names = null; }
-
-        static void Load()
-        {
-            if (parent != null) return;
-            parent = new Dictionary<int, int>();
-            names = new Dictionary<int, string>();
-            IntPtr snap = CreateToolhelp32Snapshot(0x2 /*TH32CS_SNAPPROCESS*/, 0);
-            if (snap == IntPtr.Zero || snap == new IntPtr(-1)) return;
-            try
-            {
-                PROCESSENTRY32 e = new PROCESSENTRY32();
-                e.dwSize = Marshal.SizeOf(typeof(PROCESSENTRY32));
-                if (Process32First(snap, ref e))
-                {
-                    do
-                    {
-                        parent[e.th32ProcessID] = e.th32ParentProcessID;
-                        names[e.th32ProcessID] = e.szExeFile;
-                    } while (Process32Next(snap, ref e));
-                }
-            }
-            finally { CloseHandle(snap); }
-        }
-
-        public static string NameOf(int pid)
-        {
-            Load();
-            string n;
-            return names.TryGetValue(pid, out n) ? n : ("pid " + pid);
-        }
-
-        // Audio often comes from a helper process with no UI (Chrome/Edge audio service,
-        // Electron utility processes). Walk up the parent chain to the nearest ancestor
-        // that actually owns a visible window.
-        public static int OwningWindowProcess(int pid)
-        {
-            Load();
-            int cur = pid;
-            for (int depth = 0; depth < 6; depth++)
-            {
-                if (Win.FindWindowForPid(cur) != IntPtr.Zero) return cur;
-                int p;
-                if (!parent.TryGetValue(cur, out p) || p <= 0 || p == cur) break;
-                cur = p;
-            }
-            return pid;
-        }
-    }
 
     static class Win
     {
@@ -1689,6 +1288,7 @@ namespace SoundFocus
             }
 
             watcher = new AudioWatcher();
+            AppDomain.CurrentDomain.ProcessExit += delegate { watcher.Dispose(); };
 
             if (debug)
             {
@@ -1701,7 +1301,7 @@ namespace SoundFocus
             if (showMenu)
             {
                 AttachConsole(-1);
-                for (int i = 0; i < 6; i++) { try { watcher.Tick(); } catch { } Thread.Sleep(150); }
+                watcher.Start(); watcher.WaitReady(3000); Thread.Sleep(900);
                 Smtc.Refresh();
                 Console.Write("Playing now\r\n");
                 Stopwatch sw = Stopwatch.StartNew();
@@ -1732,7 +1332,7 @@ namespace SoundFocus
             if (testTab)
             {
                 AttachConsole(-1);
-                for (int i = 0; i < 6; i++) { try { watcher.Tick(); } catch { } Thread.Sleep(150); }
+                watcher.Start(); watcher.WaitReady(3000); Thread.Sleep(900);
                 Smtc.Refresh();
                 foreach (Noisy n in watcher.Current())
                 {
@@ -1749,7 +1349,7 @@ namespace SoundFocus
             if (listOnly)
             {
                 // sample for ~1.5s so short quiet passages do not hide an app
-                for (int i = 0; i < 10; i++) { try { watcher.Tick(); } catch { } Thread.Sleep(150); }
+                watcher.Start(); watcher.WaitReady(3000); Thread.Sleep(1500);
                 Smtc.Refresh();
                 List<Noisy> now = watcher.Current();
                 StringBuilder sb = new StringBuilder("Now playing (per Windows media transport):\r\n");
@@ -1839,8 +1439,8 @@ namespace SoundFocus
                 Log.Write("STRESS MODE: poll=20ms rescan=100ms prewarm=100ms");
             }
 
-            watcher.Start();
             StartPrewarm();
+            watcher.Start();
 
             hotkeySpec = hotkey;
             returnSpec = returnHotkey;
@@ -1892,6 +1492,8 @@ namespace SoundFocus
 
             Application.Run();
 
+            stoppingPrewarm = true; prewarmWake.Set();
+            watcher.Dispose();
             if (tray != null) tray.Visible = false;
             hk.Dispose();
             return 0;
@@ -1923,20 +1525,26 @@ namespace SoundFocus
         const int TargetTtlMs = 2000;
         static int prewarmMs = 1500;
 
-        // Keeps the target list warm while anything is audible, so the cost is paid in the
-        // background instead of in the 200 ms after a right-click. Idle when silent.
+        static readonly AutoResetEvent prewarmWake = new AutoResetEvent(false);
+        static volatile bool stoppingPrewarm;
+
+        // Event-driven when silent; bounded title/tab refresh while an app is audible.
+        // SMTC may block, but cannot hold up audio detection or session discovery.
         static void StartPrewarm()
         {
+            watcher.Changed += delegate { prewarmWake.Set(); };
             Thread t = new Thread(delegate()
             {
-                while (true)
+                while (!stoppingPrewarm)
                 {
-                    // Unconditionally, and bypassing the read cache: when nothing is
-                    // audible this costs nothing, and it keeps the menu's snapshot at
-                    // most one interval old, including the moment audio starts.
-                    try { RefreshTargets(); }
-                    catch { }
-                    Thread.Sleep(prewarmMs);
+                    bool active = watcher.Current().Count > 0;
+                    try
+                    {
+                        if (active) { Smtc.Refresh(); watcher.RefreshTitles(); }
+                        RefreshTargets();
+                    }
+                    catch (Exception ex) { Log.Write("target refresh: " + ex.Message); }
+                    prewarmWake.WaitOne(active ? prewarmMs : Timeout.Infinite);
                 }
             });
             t.IsBackground = true;
@@ -1993,6 +1601,7 @@ namespace SoundFocus
             List<Target> targets = new List<Target>();
             foreach (Noisy n in watcher.Current())
             {
+                if (!ProcessIdentity.IsRunning(n.Pid, n.Started)) continue;
                 List<IntPtr> cands = Win.WindowsForPid(n.Pid);
                 if (cands.Count == 0) continue;
 
@@ -2227,7 +1836,7 @@ namespace SoundFocus
                     finally { if (hit != null) hit.Dispose(); }
                 });
                 item.Enabled = entry.IsRunning() && Win.WindowsForPid(entry.Pid).Count > 0;
-                item.ToolTipText = item.Enabled ? "Find this tab by title, or focus the app" : "Process stopped or has no available window";
+                item.ToolTipText = entry.Pid == 0 ? "Windows system sounds; no individual app can be identified" : item.Enabled ? "Find this tab by title, or focus the app" : "Process stopped or has no available window";
                 menu.Items.Add(item);
             }
 

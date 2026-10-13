@@ -122,7 +122,9 @@ Each entry jumps straight to that one window or tab, bypassing the cycle. Entrie
 listed, the menu distinguishes "(nothing)" from "(no active playback device)" — silence and
 having no working speakers look identical otherwise.
 
-The **History (last observed)** section keeps the five most recently audible processes,
+The **History (last observed)** section keeps the five most recently audible apps/sources,
+including a non-clickable **System sounds** entry when Windows plays a system sound.
+System sounds cannot identify the individual app that requested a toast. Entries are
 newest first, with the local date and time sound was last detected. Repeated observations
 update the same process entry. History is collected even while the menu is closed and
 entries already shown under Playing now are hidden from History until they go quiet. It
@@ -143,16 +145,30 @@ one. The build regenerates it if the file is missing.
 
 ## How it works
 
-- Enumerates the audio sessions of **every active render endpoint** (not just the default
-  device) via `IMMDeviceEnumerator` → `IAudioSessionManager2` → `IAudioSessionEnumerator`.
-- Polls each session's `IAudioMeterInformation::GetPeakValue` every 150 ms. Peak > threshold
-  means real samples, not just an open-but-silent stream — a paused video is not "making sound".
+- Enumerates **every active render endpoint** once, subscribes to new-session and
+  session-state callbacks, and retains a registry keyed by endpoint and session instance.
+  A 30-second reconciliation repairs missed events without rebuilding healthy managers.
+- Device callbacks update the endpoint registry when devices are added, removed or change
+  state. An expired session is normal stream teardown, not a device removal.
+- A single MTA worker samples active sessions: every 25 ms during the first 750 ms
+  after creation/activation, then 50 ms for quiet active streams or 150 ms while recently
+  audible. Inactive sessions need no periodic meter reads. With no active streams the
+  worker sleeps until an event, history-expiry deadline, or reconciliation is due.
+  On a transition to inactive it also reads the final meter value once, catching short
+  bursts that ended between timer ticks without adding a permanent fast timer.
+- Peak >= 0.0002 confirms non-silent samples. A running but silent stream does not enter
+  history. Peak meters retain only the preceding device period: this greatly improves
+  short-sound detection, but does not guarantee arbitrarily short transients.
 - An app stays in the list for 5 s after it goes quiet, so gaps between tracks or quiet
   passages do not make it vanish mid-press.
-- The system-sounds session (notification dings) is skipped.
+- System sounds are retained in history without a window-focus action.
 - Audio frequently comes from a helper process with no UI (Chrome/Edge audio service,
   Electron utility processes). The owning process is found by walking up the parent chain
-  to the nearest ancestor that actually owns a visible top-level window.
+  to the nearest ancestor that actually owns a visible top-level window. Process identity
+  and ancestry are captured when a session appears, before short-lived helpers exit.
+  Targeted process queries validate creation times at each parent link to avoid PID reuse;
+  failed parent queries retain the known source identity. Window resolution happens on a
+  separate metadata worker. History can arrive shortly after the sound is detected.
 - Windows on **other virtual desktops** are DWM-cloaked, exactly like suspended UWP ghost
   windows. Only the ghosts are filtered out: a cloaked window is rejected solely when
   `IVirtualDesktopManager` says it is on the desktop you are already looking at. Activating
@@ -255,19 +271,28 @@ sources playing across several browser windows:
 - **The target list is resolved in the background**, and the menu reads that snapshot
   without ever scanning while it opens — a menu that appears half a second after the click
   reads as a click that did nothing. The trade is a list up to one refresh interval old.
-- **Endpoints are enumerated far less often than sessions.** Sessions come and go whenever
-  an app starts playing, but endpoints only change when hardware is plugged or unplugged,
-  and rebuilding them every couple of seconds was most of the idle cost: **2.7% → 1.7%** of
-  one core, prewarming included. A session reporting *expired* means its endpoint went away
-  underneath us, so that triggers an immediate re-enumeration instead of waiting out the
-  interval.
+- **Audio discovery uses Windows callbacks.** Healthy sessions and managers are retained,
+  rather than repeatedly released and recreated. Callbacks enqueue work and retain the
+  new session safely; the MTA worker unregisters and releases everything on removal or exit.
+- **Peak sampling does no window scans or process-tree enumeration.** Process identity is
+  captured once per new session. Subsequent samples update private timestamps; history
+  snapshots are copied only for consumers.
+- **Metadata cannot block audio detection.** Media transport refresh and tab/title work
+  run outside the audio worker. The target worker wakes when the audible app set changes,
+  refreshes periodically while apps remain audible, and sleeps when none do.
+
+The timings above describe the earlier tab-cache work, not benchmarks of the new watcher.
+Use the integration probe below to compare watcher builds on the same machine.
 
 `--menu` prints these timings, so a regression here is visible rather than merely felt.
 
 ### Memory: nothing waits for the garbage collector
 
-Every UI Automation element, audio-session object and device enumerator is released the
-moment it has been read — `Marshal.FinalReleaseComObject`, not the GC. This is not
+Transient UI Automation elements and device enumerators are explicitly released rather
+than left to the GC. Audio sessions and managers now live for the duration of their
+subscriptions and are released on retirement or shutdown. Audio ownership uses balanced
+`Marshal.ReleaseComObject` calls: enumeration and callbacks can refer to the same RCW,
+so `FinalReleaseComObject` there would invalidate a still-live reference. This is not
 optional hygiene here but the difference between 40 MB and gigabytes: each element is a
 tiny managed wrapper around a native cross-process proxy and cached property store, so
 thousands of them exert no pressure on a GC that only weighs managed bytes. It simply
@@ -311,6 +336,33 @@ Ctrl+Alt+Shift+D and the extension never fires.
 
 ## Tuning
 
-Constants at the top of `AudioWatcher` in `SoundFocus.cs`:
-`Threshold` (0.0002), `MemoryMs` (5000), `PollMs` (150), `RescanMs` (2000),
+Fields at the top of `AudioWatcher` in `AudioWatcher.cs`:
+`Threshold` (0.0002), `MemoryMs` (5000), `BurstPollMs` (25), `BurstMs` (750),
+`QuietPollMs` (50), `PollMs` (150), `RescanMs` (30000),
 plus `Program.CycleResetMs` (4000).
+
+
+## Audio detection integration probe
+
+```powershell
+dotnet build -c Release -o artifacts/candidate
+dotnet build tests/AudioProbe.csproj -c Release
+powershell -NoProfile -File tests/run-probe.ps1 -Variant candidate
+```
+
+The Windows-only probe plays quiet, brief tones from child processes. It creates an owner
+window on a private desktop to verify parent attribution without taking focus. The wrapper
+uses the local hidden-desktop helper at `C:\Users\mjb\tools\agent-scripts\Invoke-OnHiddenDesktop.ps1`.
+To use another machine, run `AudioProbe.exe <absolute-path-to-SoundFocus.exe> <report-path>`
+on a test desktop. The probe tests 20/50/100/571 ms fresh streams, a sound after silence
+inside an already-active stream, silent-stream rejection, immutable history snapshots,
+system-sound capture, PowerShell SoundPlayer attribution, 80 short-lived silent helpers,
+and disposal. It measures watcher-process CPU, handles, private bytes and generation-zero
+collections. The 20/50 ms results are characterization, not a guarantee; 100/571 ms and
+the delayed 100 ms cases are required to pass. Other apps playing during the run can
+affect history capacity and resource measurements.
+
+Reports go to `artifacts/<variant>-probe.txt`. `-Trace trace` enables detailed event/peak
+logging for diagnosis; leave it off for resource measurements. `--debug` now reports the
+live session registry plus meter-read, wakeup, discovery, retirement, device-scan and error
+counters, using the same MTA watcher as normal operation.
