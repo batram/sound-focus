@@ -136,7 +136,7 @@ namespace SoundFocus
     class SoundHistoryEntry
     {
         public int Pid;
-        public string Name, Title;
+        public string Name, Title, TabTitle;
         public DateTime Started, Observed;
 
         public bool IsRunning()
@@ -317,7 +317,8 @@ namespace SoundFocus
                 }
                 if (index >= 0) history.RemoveAt(index);
                 history.Insert(0, new SoundHistoryEntry { Pid = owner, Name = n.Name,
-                    Started = started, Observed = observed, Title = title });
+                    Started = started, Observed = observed, Title = title,
+                    TabTitle = previous == null ? null : previous.TabTitle });
                 if (history.Count > 5) history.RemoveAt(5);
             }
         }
@@ -325,6 +326,20 @@ namespace SoundFocus
         public List<SoundHistoryEntry> History()
         {
             lock (gate) return new List<SoundHistoryEntry>(history);
+        }
+
+        public void RememberTab(int pid, string title)
+        {
+            if (string.IsNullOrEmpty(title)) return;
+            lock (gate)
+            {
+                int index = history.FindIndex(delegate(SoundHistoryEntry h) { return h.Pid == pid && h.IsRunning(); });
+                if (index < 0) return;
+                SoundHistoryEntry entry = history[index];
+                // Replace rather than mutate: an open menu owns its observation snapshot.
+                history[index] = new SoundHistoryEntry { Pid = entry.Pid, Name = entry.Name,
+                    Started = entry.Started, Observed = entry.Observed, Title = entry.Title, TabTitle = title };
+            }
         }
 
         public string LastScanNote = "";
@@ -1149,7 +1164,7 @@ namespace SoundFocus
 
         // Runs the search on its own MTA thread with a hard timeout: UI Automation talks
         // to another process, and a busy browser must never wedge the hotkey.
-        public static Hit Find(List<IntPtr> windows, string mediaTitle, int timeoutMs)
+        public static Hit Find(List<IntPtr> windows, string mediaTitle, int timeoutMs, bool titleOnly = false)
         {
             Hit result = null;
             bool[] abandoned = { false };
@@ -1157,7 +1172,7 @@ namespace SoundFocus
             {
                 try
                 {
-                    Hit h = Search(windows, mediaTitle);
+                    Hit h = Search(windows, mediaTitle, titleOnly);
                     lock (abandoned)
                     {
                         // the caller gave up waiting: nobody will ever dispose this
@@ -1175,7 +1190,7 @@ namespace SoundFocus
             return result;
         }
 
-        static Hit Search(List<IntPtr> windows, string mediaTitle)
+        static Hit Search(List<IntPtr> windows, string mediaTitle, bool titleOnly)
         {
             Hit byTitle = null, byButton = null;
             StringBuilder timing = new StringBuilder();
@@ -1237,6 +1252,17 @@ namespace SoundFocus
                                 tabCount++;
                                 string name = CachedString(tab, UIA_NamePropertyId);
 
+                                if (titleOnly)
+                                {
+                                    if (TitlesMatch(name, mediaTitle))
+                                    {
+                                        found = NewHit(hwnd, tab, name);
+                                        keepTab = true;
+                                        break;
+                                    }
+                                    continue;
+                                }
+
                                 // Two signals, ranked. A tab whose name says it is playing
                                 // is stating a fact; a mute button only means the tab can
                                 // make sound - Firefox shows one while audible, but other
@@ -1288,6 +1314,12 @@ namespace SoundFocus
                 return byButton;
             }
             return byTitle;
+        }
+
+        static bool TitlesMatch(string actual, string expected)
+        {
+            return !string.IsNullOrWhiteSpace(expected) &&
+                string.Equals(CleanTitle(actual), CleanTitle(expected), StringComparison.OrdinalIgnoreCase);
         }
 
         static Hit NewHit(IntPtr hwnd, IUIAutomationElement tab, string title)
@@ -1928,6 +1960,8 @@ namespace SoundFocus
         static List<Target> RefreshTargets()
         {
             List<Target> fresh = ResolveTargetsUncached();
+            foreach (Target target in fresh)
+                if (target.Tab != null) watcher.RememberTab(target.Owner.Pid, target.Tab.Title);
             List<Target> old;
             lock (targetGate)
             {
@@ -2035,7 +2069,7 @@ namespace SoundFocus
             }
         }
 
-        static void GoTo(Target t)
+        static void GoTo(Target t, bool allowShortcut = true)
         {
             RememberOrigin();
             lastFocused = t.Window;
@@ -2046,7 +2080,7 @@ namespace SoundFocus
 
             // only if we could not reach the tab ourselves, hand off to an in-app shortcut
             int[] chord;
-            if (!tabDone && sendKeys.TryGetValue((t.Owner.Name ?? "").ToLowerInvariant(), out chord))
+            if (allowShortcut && !tabDone && sendKeys.TryGetValue((t.Owner.Name ?? "").ToLowerInvariant(), out chord))
             {
                 if (Win.WaitForForeground(t.Window, 1200))
                     Win.SendChord(chord[0], chord[1], t.Window, t.Owner.Pid);
@@ -2172,7 +2206,7 @@ namespace SoundFocus
             foreach (SoundHistoryEntry entry in history)
             {
                 SoundHistoryEntry captured = entry;
-                string title = entry.Title ?? "";
+                string title = entry.TabTitle ?? entry.Title ?? "";
                 if (title.Length > 55) title = title.Substring(0, 54) + "…";
                 string label = entry.Observed.ToString("yyyy-MM-dd HH:mm:ss") + "  —  " + entry.Name;
                 if (title.Length > 0) label += "  —  " + title;
@@ -2180,15 +2214,20 @@ namespace SoundFocus
                 {
                     // Recheck at click time, including process identity: Windows reuses PIDs.
                     if (!captured.IsRunning()) return;
-                    foreach (Target target in TargetsNow())
-                        if (target.Owner.Pid == captured.Pid) { GoTo(target); return; }
                     List<IntPtr> windows = Win.WindowsForPid(captured.Pid);
-                    if (windows.Count > 0)
-                        GoTo(new Target { Window = windows[0],
-                            Owner = new Noisy { Pid = captured.Pid, Name = captured.Name } });
+                    if (windows.Count == 0) return;
+                    TabHunter.Hit hit = useTabs ? TabHunter.Find(windows,
+                        captured.TabTitle ?? captured.Title, 2000, true) : null;
+                    try
+                    {
+                        if (!captured.IsRunning()) return;
+                        GoTo(new Target { Window = hit != null ? hit.Window : windows[0], Tab = hit,
+                            Owner = new Noisy { Pid = captured.Pid, Name = captured.Name } }, false);
+                    }
+                    finally { if (hit != null) hit.Dispose(); }
                 });
                 item.Enabled = entry.IsRunning() && Win.WindowsForPid(entry.Pid).Count > 0;
-                item.ToolTipText = item.Enabled ? "Jump to this app" : "Process stopped or has no available window";
+                item.ToolTipText = item.Enabled ? "Find this tab by title, or focus the app" : "Process stopped or has no available window";
                 menu.Items.Add(item);
             }
 
